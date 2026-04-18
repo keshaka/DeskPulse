@@ -67,6 +67,11 @@ XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 // -------------------- Runtime State --------------------
 unsigned long lastPollMs = 0;
 bool refreshPending = false;
+unsigned long prevNetSampleMs = 0;
+uint64_t prevBytesSent = 0;
+uint64_t prevBytesReceived = 0;
+float gUploadBytesPerSec = 0.0f;
+float gDownloadBytesPerSec = 0.0f;
 
 struct StatsData {
   char apiStatus[16];
@@ -123,20 +128,23 @@ lv_obj_t* labelHeaderTitle;
 lv_obj_t* labelHeaderStatus;
 
 // Dashboard widgets
-lv_obj_t* barCpu;
-lv_obj_t* barRam;
-lv_obj_t* barTemp;
-lv_obj_t* labelCpuValue;
-lv_obj_t* labelRamValue;
-lv_obj_t* labelTempValue;
-lv_obj_t* labelDashNowPlaying;
-lv_obj_t* labelDashNowState;
+lv_obj_t* barDashCpu;
+lv_obj_t* barDashGpu;
+lv_obj_t* barDashRam;
+lv_obj_t* labelDashCpuValue;
+lv_obj_t* labelDashGpuValue;
+lv_obj_t* labelDashRamValue;
+lv_obj_t* labelDashNetValue;
 
 // System page
 lv_obj_t* labelSystemCpu;
 lv_obj_t* labelSystemCpuTemp;
 lv_obj_t* labelSystemRam;
+lv_obj_t* labelSystemGpu;
+lv_obj_t* labelSystemGpuVram;
 lv_obj_t* labelSystemDisk;
+lv_obj_t* labelSystemNetBytes;
+lv_obj_t* labelSystemNetPackets;
 lv_obj_t* labelSystemApi;
 
 // GPU / Network page
@@ -146,6 +154,10 @@ lv_obj_t* labelNetBytes;
 lv_obj_t* labelNetPackets;
 
 // Media page
+lv_obj_t* mediaHeroCard;
+lv_obj_t* mediaControlsCard;
+lv_obj_t* labelMediaHint;
+lv_obj_t* labelMediaActionStatus;
 lv_obj_t* labelMediaState;
 lv_obj_t* labelMediaPlayer;
 lv_obj_t* labelMediaTitle;
@@ -170,6 +182,91 @@ void setSafeCopy(char* dst, size_t dstSize, const char* src, const char* fallbac
     finalSrc = fallback;
   }
   strlcpy(dst, finalSrc, dstSize);
+}
+
+void formatSpeed(char* dst, size_t dstSize, float bytesPerSec) {
+  if (bytesPerSec < 1024.0f) {
+    snprintf(dst, dstSize, "%.0f B/s", bytesPerSec);
+  } else if (bytesPerSec < (1024.0f * 1024.0f)) {
+    snprintf(dst, dstSize, "%.1f KB/s", bytesPerSec / 1024.0f);
+  } else {
+    snprintf(dst, dstSize, "%.2f MB/s", bytesPerSec / (1024.0f * 1024.0f));
+  }
+}
+
+void styleCard(lv_obj_t* obj);
+
+void styleMediaCard(lv_obj_t* obj) {
+  styleCard(obj);
+  lv_obj_set_style_bg_color(obj, lv_color_hex(0x10141B), LV_PART_MAIN);
+  lv_obj_set_style_border_color(obj, lv_color_hex(0x243043), LV_PART_MAIN);
+}
+
+void styleMediaButton(lv_obj_t* obj, lv_color_t bgColor) {
+  lv_obj_set_style_bg_color(obj, bgColor, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+  lv_obj_set_style_radius(obj, 14, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+  lv_obj_set_style_text_color(obj, lv_color_hex(0xF5F7FA), LV_PART_MAIN);
+  lv_obj_set_style_text_font(obj, &lv_font_montserrat_12, LV_PART_MAIN);
+}
+
+String getApiBaseUrl() {
+  String baseUrl = SERVER_URL;
+  int statsIndex = baseUrl.lastIndexOf("/stats");
+  if (statsIndex >= 0) {
+    baseUrl = baseUrl.substring(0, statsIndex);
+  }
+  return baseUrl;
+}
+
+void sendMediaCommand(const char* endpoint) {
+  if (WiFi.status() != WL_CONNECTED || endpoint == nullptr || endpoint[0] == '\0') {
+    if (labelMediaActionStatus != nullptr) {
+      lv_label_set_text(labelMediaActionStatus, "Action unavailable");
+    }
+    return;
+  }
+
+  HTTPClient http;
+  String url = getApiBaseUrl() + endpoint;
+  if (!http.begin(url)) {
+    if (labelMediaActionStatus != nullptr) {
+      lv_label_set_text(labelMediaActionStatus, "Command failed");
+    }
+    return;
+  }
+
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  int httpCode = http.POST("");
+  http.end();
+
+  if (labelMediaActionStatus != nullptr) {
+    if (httpCode > 0 && httpCode < 400) {
+      if (strcmp(endpoint, "/playpause") == 0) {
+        lv_label_set_text(labelMediaActionStatus, "Play/Pause sent");
+      } else if (strcmp(endpoint, "/previous") == 0) {
+        lv_label_set_text(labelMediaActionStatus, "Previous sent");
+      } else if (strcmp(endpoint, "/next") == 0) {
+        lv_label_set_text(labelMediaActionStatus, "Next sent");
+      } else if (strcmp(endpoint, "/volume_down") == 0) {
+        lv_label_set_text(labelMediaActionStatus, "Volume down sent");
+      } else if (strcmp(endpoint, "/volume_up") == 0) {
+        lv_label_set_text(labelMediaActionStatus, "Volume up sent");
+      } else {
+        lv_label_set_text(labelMediaActionStatus, "Command sent");
+      }
+    } else {
+      lv_label_set_text(labelMediaActionStatus, "Command failed");
+    }
+  }
+}
+
+void onMediaControlClicked(lv_event_t* e) {
+  const char* endpoint = static_cast<const char*>(lv_event_get_user_data(e));
+  sendMediaCommand(endpoint);
 }
 
 // -------------------- LVGL Display + Touch --------------------
@@ -277,97 +374,96 @@ void createDashboardPage() {
 
   lv_obj_t* cardCpu = lv_obj_create(tabDashboard);
   lv_obj_set_size(cardCpu, 148, 64);
-  lv_obj_set_pos(cardCpu, 6, 8);
+  lv_obj_set_pos(cardCpu, 4, 6);
   styleCard(cardCpu);
 
   lv_obj_t* labelCpuTitle = lv_label_create(cardCpu);
-  lv_label_set_text(labelCpuTitle, "CPU");
+  lv_label_set_text(labelCpuTitle, "CPU Usage + Temp");
   lv_obj_set_style_text_color(labelCpuTitle, lv_color_hex(0xD8E1EC), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelCpuTitle, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelCpuTitle, &lv_font_montserrat_12, LV_PART_MAIN);
   lv_obj_set_pos(labelCpuTitle, 0, 0);
 
-  labelCpuValue = lv_label_create(cardCpu);
-  lv_label_set_text(labelCpuValue, "0.0%");
-  lv_obj_set_style_text_color(labelCpuValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelCpuValue, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_align(labelCpuValue, LV_ALIGN_TOP_RIGHT, 0, 0);
+  labelDashCpuValue = lv_label_create(cardCpu);
+  lv_label_set_text(labelDashCpuValue, "0.0% | N/A");
+  lv_obj_set_width(labelDashCpuValue, 132);
+  lv_label_set_long_mode(labelDashCpuValue, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(labelDashCpuValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelDashCpuValue, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelDashCpuValue, 0, 16);
 
-  barCpu = lv_bar_create(cardCpu);
-  lv_obj_set_size(barCpu, 132, 12);
-  lv_obj_set_pos(barCpu, 0, 36);
-  lv_bar_set_range(barCpu, 0, 100);
-  styleBar(barCpu, lv_color_hex(0x27C97B));
+  barDashCpu = lv_bar_create(cardCpu);
+  lv_obj_set_size(barDashCpu, 132, 8);
+  lv_obj_set_pos(barDashCpu, 0, 38);
+  lv_bar_set_range(barDashCpu, 0, 100);
+  styleBar(barDashCpu, lv_color_hex(0x27C97B));
+
+  lv_obj_t* cardGpu = lv_obj_create(tabDashboard);
+  lv_obj_set_size(cardGpu, 148, 64);
+  lv_obj_set_pos(cardGpu, 160, 6);
+  styleCard(cardGpu);
+
+  lv_obj_t* labelGpuTitle = lv_label_create(cardGpu);
+  lv_label_set_text(labelGpuTitle, "GPU Usage + Temp");
+  lv_obj_set_style_text_color(labelGpuTitle, lv_color_hex(0xD8E1EC), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelGpuTitle, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelGpuTitle, 0, 0);
+
+  labelDashGpuValue = lv_label_create(cardGpu);
+  lv_label_set_text(labelDashGpuValue, "N/A");
+  lv_obj_set_width(labelDashGpuValue, 132);
+  lv_label_set_long_mode(labelDashGpuValue, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(labelDashGpuValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelDashGpuValue, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelDashGpuValue, 0, 16);
+
+  barDashGpu = lv_bar_create(cardGpu);
+  lv_obj_set_size(barDashGpu, 132, 8);
+  lv_obj_set_pos(barDashGpu, 0, 38);
+  lv_bar_set_range(barDashGpu, 0, 100);
+  styleBar(barDashGpu, lv_color_hex(0x6C8BFF));
 
   lv_obj_t* cardRam = lv_obj_create(tabDashboard);
-  lv_obj_set_size(cardRam, 148, 64);
-  lv_obj_set_pos(cardRam, 160, 8);
+  lv_obj_set_size(cardRam, 302, 52);
+  lv_obj_set_pos(cardRam, 4, 75);
   styleCard(cardRam);
 
   lv_obj_t* labelRamTitle = lv_label_create(cardRam);
-  lv_label_set_text(labelRamTitle, "RAM");
+  lv_label_set_text(labelRamTitle, "RAM Usage");
   lv_obj_set_style_text_color(labelRamTitle, lv_color_hex(0xD8E1EC), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelRamTitle, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelRamTitle, &lv_font_montserrat_12, LV_PART_MAIN);
   lv_obj_set_pos(labelRamTitle, 0, 0);
 
-  labelRamValue = lv_label_create(cardRam);
-  lv_label_set_text(labelRamValue, "0.0%");
-  lv_obj_set_style_text_color(labelRamValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelRamValue, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_align(labelRamValue, LV_ALIGN_TOP_RIGHT, 0, 0);
+  labelDashRamValue = lv_label_create(cardRam);
+  lv_label_set_text(labelDashRamValue, "0.0% | 0.00/0.00 GB");
+  lv_obj_set_style_text_color(labelDashRamValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelDashRamValue, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_align(labelDashRamValue, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-  barRam = lv_bar_create(cardRam);
-  lv_obj_set_size(barRam, 132, 12);
-  lv_obj_set_pos(barRam, 0, 36);
-  lv_bar_set_range(barRam, 0, 100);
-  styleBar(barRam, lv_color_hex(0x3A8DFF));
+  barDashRam = lv_bar_create(cardRam);
+  lv_obj_set_size(barDashRam, 286, 8);
+  lv_obj_set_pos(barDashRam, 0, 25);
+  lv_bar_set_range(barDashRam, 0, 100);
+  styleBar(barDashRam, lv_color_hex(0x3A8DFF));
 
-  lv_obj_t* cardTemp = lv_obj_create(tabDashboard);
-  lv_obj_set_size(cardTemp, 302, 64);
-  lv_obj_set_pos(cardTemp, 6, 78);
-  styleCard(cardTemp);
+  lv_obj_t* cardNet = lv_obj_create(tabDashboard);
+  lv_obj_set_size(cardNet, 302, 52);
+  lv_obj_set_pos(cardNet, 4, 133);
+  styleCard(cardNet);
 
-  lv_obj_t* labelTempTitle = lv_label_create(cardTemp);
-  lv_label_set_text(labelTempTitle, "Temperature");
-  lv_obj_set_style_text_color(labelTempTitle, lv_color_hex(0xD8E1EC), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelTempTitle, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelTempTitle, 0, 0);
+  lv_obj_t* labelNetTitle = lv_label_create(cardNet);
+  lv_label_set_text(labelNetTitle, "Network Speed (Download / Upload)");
+  lv_obj_set_style_text_color(labelNetTitle, lv_color_hex(0xD8E1EC), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelNetTitle, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelNetTitle, 0, 0);
 
-  labelTempValue = lv_label_create(cardTemp);
-  lv_label_set_text(labelTempValue, "N/A");
-  lv_obj_set_style_text_color(labelTempValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelTempValue, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_align(labelTempValue, LV_ALIGN_TOP_RIGHT, 0, 0);
+  labelDashNetValue = lv_label_create(cardNet);
+  lv_label_set_text(labelDashNetValue, "Down: 0 B/s | Up: 0 B/s");
+  lv_obj_set_width(labelDashNetValue, 286);
+  lv_label_set_long_mode(labelDashNetValue, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(labelDashNetValue, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelDashNetValue, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelDashNetValue, 0, 20);
 
-  barTemp = lv_bar_create(cardTemp);
-  lv_obj_set_size(barTemp, 286, 12);
-  lv_obj_set_pos(barTemp, 0, 36);
-  lv_bar_set_range(barTemp, 0, 100);
-  styleBar(barTemp, lv_color_hex(0xFF8A3D));
-
-  lv_obj_t* cardMedia = lv_obj_create(tabDashboard);
-  lv_obj_set_size(cardMedia, 302, 74);
-  lv_obj_set_pos(cardMedia, 6, 148);
-  styleCard(cardMedia);
-
-  lv_obj_t* labelNow = lv_label_create(cardMedia);
-  lv_label_set_text(labelNow, "Now Playing");
-  lv_obj_set_style_text_color(labelNow, lv_color_hex(0x93A1B5), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelNow, &lv_font_montserrat_12, LV_PART_MAIN);
-  lv_obj_set_pos(labelNow, 0, 0);
-
-  labelDashNowState = lv_label_create(cardMedia);
-  lv_label_set_text(labelDashNowState, "idle");
-  lv_obj_set_style_text_color(labelDashNowState, lv_color_hex(0x62D394), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelDashNowState, &lv_font_montserrat_12, LV_PART_MAIN);
-  lv_obj_align(labelDashNowState, LV_ALIGN_TOP_RIGHT, 0, 0);
-
-  labelDashNowPlaying = lv_label_create(cardMedia);
-  lv_label_set_text(labelDashNowPlaying, "No media playing");
-  lv_obj_set_style_text_color(labelDashNowPlaying, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelDashNowPlaying, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_width(labelDashNowPlaying, 286);
-  lv_label_set_long_mode(labelDashNowPlaying, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(labelDashNowPlaying, 0, 22);
 }
 
 void createSystemPage() {
@@ -377,32 +473,74 @@ void createSystemPage() {
   labelSystemCpu = lv_label_create(tabSystem);
   lv_label_set_text(labelSystemCpu, "CPU: 0.0%");
   lv_obj_set_style_text_color(labelSystemCpu, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelSystemCpu, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelSystemCpu, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemCpu, 300);
+  lv_label_set_long_mode(labelSystemCpu, LV_LABEL_LONG_DOT);
   lv_obj_set_pos(labelSystemCpu, 8, 24);
 
   labelSystemCpuTemp = lv_label_create(tabSystem);
   lv_label_set_text(labelSystemCpuTemp, "CPU Temp: N/A");
   lv_obj_set_style_text_color(labelSystemCpuTemp, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelSystemCpuTemp, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelSystemCpuTemp, 8, 46);
+  lv_obj_set_style_text_font(labelSystemCpuTemp, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemCpuTemp, 300);
+  lv_label_set_long_mode(labelSystemCpuTemp, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemCpuTemp, 8, 42);
 
   labelSystemRam = lv_label_create(tabSystem);
-  lv_label_set_text(labelSystemRam, "RAM: 0.0% | 0.00/0.00 GB");
+  lv_label_set_text(labelSystemRam, "RAM: 0.0% | U:0.00 A:0.00 T:0.00 GB");
   lv_obj_set_style_text_color(labelSystemRam, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelSystemRam, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelSystemRam, 8, 68);
+  lv_obj_set_style_text_font(labelSystemRam, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemRam, 300);
+  lv_label_set_long_mode(labelSystemRam, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemRam, 8, 60);
+
+  labelSystemGpu = lv_label_create(tabSystem);
+  lv_label_set_text(labelSystemGpu, "GPU: unavailable");
+  lv_obj_set_style_text_color(labelSystemGpu, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelSystemGpu, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemGpu, 300);
+  lv_label_set_long_mode(labelSystemGpu, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemGpu, 8, 78);
+
+  labelSystemGpuVram = lv_label_create(tabSystem);
+  lv_label_set_text(labelSystemGpuVram, "VRAM: 0.0/0.0 MB (0.0%)");
+  lv_obj_set_style_text_color(labelSystemGpuVram, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelSystemGpuVram, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemGpuVram, 300);
+  lv_label_set_long_mode(labelSystemGpuVram, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemGpuVram, 8, 96);
 
   labelSystemDisk = lv_label_create(tabSystem);
-  lv_label_set_text(labelSystemDisk, "Disk: 0.0% | 0.00/0.00 GB");
+  lv_label_set_text(labelSystemDisk, "Disk: 0.0% | U:0.00 F:0.00 T:0.00 GB");
   lv_obj_set_style_text_color(labelSystemDisk, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelSystemDisk, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelSystemDisk, 8, 90);
+  lv_obj_set_style_text_font(labelSystemDisk, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemDisk, 300);
+  lv_label_set_long_mode(labelSystemDisk, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemDisk, 8, 114);
+
+  labelSystemNetBytes = lv_label_create(tabSystem);
+  lv_label_set_text(labelSystemNetBytes, "Net Bytes S/R: 0 / 0");
+  lv_obj_set_style_text_color(labelSystemNetBytes, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelSystemNetBytes, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemNetBytes, 300);
+  lv_label_set_long_mode(labelSystemNetBytes, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemNetBytes, 8, 132);
+
+  labelSystemNetPackets = lv_label_create(tabSystem);
+  lv_label_set_text(labelSystemNetPackets, "Net Packets S/R: 0 / 0");
+  lv_obj_set_style_text_color(labelSystemNetPackets, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelSystemNetPackets, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_width(labelSystemNetPackets, 300);
+  lv_label_set_long_mode(labelSystemNetPackets, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemNetPackets, 8, 150);
 
   labelSystemApi = lv_label_create(tabSystem);
   lv_label_set_text(labelSystemApi, "API: unknown | ts: --");
   lv_obj_set_style_text_color(labelSystemApi, lv_color_hex(0x93A1B5), LV_PART_MAIN);
   lv_obj_set_style_text_font(labelSystemApi, &lv_font_montserrat_12, LV_PART_MAIN);
-  lv_obj_set_pos(labelSystemApi, 8, 116);
+  lv_obj_set_width(labelSystemApi, 300);
+  lv_label_set_long_mode(labelSystemApi, LV_LABEL_LONG_DOT);
+  lv_obj_set_pos(labelSystemApi, 8, 168);
 }
 
 void createGpuNetPage() {
@@ -436,40 +574,123 @@ void createGpuNetPage() {
 
 void createMediaPage() {
   lv_obj_set_style_pad_all(tabMedia, 8, LV_PART_MAIN);
-  createSectionTitle(tabMedia, "MEDIA", 0);
 
-  labelMediaState = lv_label_create(tabMedia);
+  mediaHeroCard = lv_obj_create(tabMedia);
+  lv_obj_set_size(mediaHeroCard, 302, 84);
+  lv_obj_set_pos(mediaHeroCard, 2, 2);
+  styleMediaCard(mediaHeroCard);
+
+  lv_obj_t* heroTitle = lv_label_create(mediaHeroCard);
+  lv_label_set_text(heroTitle, "Now Playing");
+  lv_obj_set_style_text_color(heroTitle, lv_color_hex(0x9BA7B8), LV_PART_MAIN);
+  lv_obj_set_style_text_font(heroTitle, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(heroTitle, 0, 0);
+
+  labelMediaState = lv_label_create(mediaHeroCard);
   lv_label_set_text(labelMediaState, "State: idle");
   lv_obj_set_style_text_color(labelMediaState, lv_color_hex(0x62D394), LV_PART_MAIN);
   lv_obj_set_style_text_font(labelMediaState, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelMediaState, 8, 24);
+  lv_obj_set_pos(labelMediaState, 170, 0);
 
-  labelMediaPlayer = lv_label_create(tabMedia);
+  labelMediaPlayer = lv_label_create(mediaHeroCard);
   lv_label_set_text(labelMediaPlayer, "Player: --");
-  lv_obj_set_style_text_color(labelMediaPlayer, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelMediaPlayer, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelMediaPlayer, 8, 46);
+  lv_obj_set_style_text_color(labelMediaPlayer, lv_color_hex(0xB7C1D1), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelMediaPlayer, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelMediaPlayer, 0, 18);
 
-  labelMediaTitle = lv_label_create(tabMedia);
+  labelMediaTitle = lv_label_create(mediaHeroCard);
   lv_label_set_text(labelMediaTitle, "Title: --");
-  lv_obj_set_width(labelMediaTitle, 300);
+  lv_obj_set_width(labelMediaTitle, 286);
   lv_label_set_long_mode(labelMediaTitle, LV_LABEL_LONG_DOT);
   lv_obj_set_style_text_color(labelMediaTitle, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelMediaTitle, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelMediaTitle, 8, 74);
+  lv_obj_set_style_text_font(labelMediaTitle, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelMediaTitle, 0, 37);
 
-  labelMediaArtist = lv_label_create(tabMedia);
+  labelMediaArtist = lv_label_create(mediaHeroCard);
   lv_label_set_text(labelMediaArtist, "Artist: --");
-  lv_obj_set_width(labelMediaArtist, 300);
+  lv_obj_set_width(labelMediaArtist, 286);
   lv_label_set_long_mode(labelMediaArtist, LV_LABEL_LONG_DOT);
-  lv_obj_set_style_text_color(labelMediaArtist, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelMediaArtist, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelMediaArtist, 8, 96);
+  lv_obj_set_style_text_color(labelMediaArtist, lv_color_hex(0xB7C1D1), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelMediaArtist, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelMediaArtist, 0, 56);
+
+  labelMediaActionStatus = lv_label_create(mediaHeroCard);
+  lv_label_set_text(labelMediaActionStatus, "Ready");
+  lv_obj_set_style_text_color(labelMediaActionStatus, lv_color_hex(0x7FA8FF), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelMediaActionStatus, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelMediaActionStatus, 170, 18);
+
+  mediaControlsCard = lv_obj_create(tabMedia);
+  lv_obj_set_size(mediaControlsCard, 302, 86);
+  lv_obj_set_pos(mediaControlsCard, 2, 93);
+  styleMediaCard(mediaControlsCard);
+
+  lv_obj_t* controlsTitle = lv_label_create(mediaControlsCard);
+  lv_label_set_text(controlsTitle, "Controls");
+  lv_obj_set_style_text_color(controlsTitle, lv_color_hex(0x9BA7B8), LV_PART_MAIN);
+  lv_obj_set_style_text_font(controlsTitle, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(controlsTitle, 0, 0);
+
+  labelMediaHint = lv_label_create(mediaControlsCard);
+  lv_label_set_text(labelMediaHint, "Tap a button to control playback");
+  lv_obj_set_style_text_color(labelMediaHint, lv_color_hex(0x6E7B8D), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelMediaHint, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_set_pos(labelMediaHint, 0, 14);
+
+  const int buttonY = 34;
+  const int buttonW = 54;
+  const int buttonH = 28;
+  const int buttonGap = 4;
+
+  lv_obj_t* btnPrev = lv_btn_create(mediaControlsCard);
+  lv_obj_set_size(btnPrev, buttonW, buttonH);
+  lv_obj_set_pos(btnPrev, 0, buttonY);
+  styleMediaButton(btnPrev, lv_color_hex(0x243043));
+  lv_obj_add_event_cb(btnPrev, onMediaControlClicked, LV_EVENT_CLICKED, (void*)"/previous");
+  lv_obj_t* btnPrevLabel = lv_label_create(btnPrev);
+  lv_label_set_text(btnPrevLabel, "<<");
+  lv_obj_center(btnPrevLabel);
+
+  lv_obj_t* btnVolDown = lv_btn_create(mediaControlsCard);
+  lv_obj_set_size(btnVolDown, buttonW, buttonH);
+  lv_obj_set_pos(btnVolDown, buttonW + buttonGap, buttonY);
+  styleMediaButton(btnVolDown, lv_color_hex(0x1E3C59));
+  lv_obj_add_event_cb(btnVolDown, onMediaControlClicked, LV_EVENT_CLICKED, (void*)"/volume_down");
+  lv_obj_t* btnVolDownLabel = lv_label_create(btnVolDown);
+  lv_label_set_text(btnVolDownLabel, "-");
+  lv_obj_center(btnVolDownLabel);
+
+  lv_obj_t* btnPlay = lv_btn_create(mediaControlsCard);
+  lv_obj_set_size(btnPlay, buttonW, buttonH);
+  lv_obj_set_pos(btnPlay, (buttonW + buttonGap) * 2, buttonY);
+  styleMediaButton(btnPlay, lv_color_hex(0x1B6A4A));
+  lv_obj_add_event_cb(btnPlay, onMediaControlClicked, LV_EVENT_CLICKED, (void*)"/playpause");
+  lv_obj_t* btnPlayLabel = lv_label_create(btnPlay);
+  lv_label_set_text(btnPlayLabel, "Play");
+  lv_obj_center(btnPlayLabel);
+
+  lv_obj_t* btnVolUp = lv_btn_create(mediaControlsCard);
+  lv_obj_set_size(btnVolUp, buttonW, buttonH);
+  lv_obj_set_pos(btnVolUp, (buttonW + buttonGap) * 3, buttonY);
+  styleMediaButton(btnVolUp, lv_color_hex(0x1E3C59));
+  lv_obj_add_event_cb(btnVolUp, onMediaControlClicked, LV_EVENT_CLICKED, (void*)"/volume_up");
+  lv_obj_t* btnVolUpLabel = lv_label_create(btnVolUp);
+  lv_label_set_text(btnVolUpLabel, "+");
+  lv_obj_center(btnVolUpLabel);
+
+  lv_obj_t* btnNext = lv_btn_create(mediaControlsCard);
+  lv_obj_set_size(btnNext, buttonW, buttonH);
+  lv_obj_set_pos(btnNext, (buttonW + buttonGap) * 4, buttonY);
+  styleMediaButton(btnNext, lv_color_hex(0x243043));
+  lv_obj_add_event_cb(btnNext, onMediaControlClicked, LV_EVENT_CLICKED, (void*)"/next");
+  lv_obj_t* btnNextLabel = lv_label_create(btnNext);
+  lv_label_set_text(btnNextLabel, ">>");
+  lv_obj_center(btnNextLabel);
 }
 
 void createUi() {
   lv_obj_t* scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0B1018), LV_PART_MAIN);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_scrollbar_mode(scr, LV_SCROLLBAR_MODE_OFF);
 
@@ -490,19 +711,28 @@ void createUi() {
   tabGpuNet = lv_tabview_add_tab(tabview, "GPU/Net");
   tabMedia = lv_tabview_add_tab(tabview, "Media");
 
+  lv_obj_set_style_bg_color(tabDashboard, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabDashboard, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabSystem, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabSystem, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabGpuNet, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabGpuNet, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabMedia, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabMedia, LV_OPA_COVER, LV_PART_MAIN);
+
   createDashboardPage();
   createSystemPage();
   createGpuNetPage();
   createMediaPage();
 
   labelHeaderTitle = lv_label_create(scr);
-  lv_label_set_text(labelHeaderTitle, "DeskPulse");
+  lv_label_set_text(labelHeaderTitle, "");
   lv_obj_set_style_text_color(labelHeaderTitle, lv_color_hex(0xF2F5F9), LV_PART_MAIN);
   lv_obj_set_style_text_font(labelHeaderTitle, &lv_font_montserrat_12, LV_PART_MAIN);
   lv_obj_align(labelHeaderTitle, LV_ALIGN_TOP_LEFT, 6, 8);
 
   labelHeaderStatus = lv_label_create(scr);
-  lv_label_set_text(labelHeaderStatus, "Starting...");
+  lv_label_set_text(labelHeaderStatus, "");
   lv_obj_set_style_text_color(labelHeaderStatus, lv_color_hex(0x62D394), LV_PART_MAIN);
   lv_obj_set_style_text_font(labelHeaderStatus, &lv_font_montserrat_12, LV_PART_MAIN);
   lv_obj_align(labelHeaderStatus, LV_ALIGN_TOP_RIGHT, -6, 8);
@@ -513,39 +743,46 @@ void refreshUiFromStats() {
   char line[128];
 
   if (!gStats.valid) {
-    lv_label_set_text(labelHeaderStatus, "Offline / no data");
-    lv_label_set_text(labelDashNowState, "idle");
-    lv_label_set_text(labelDashNowPlaying, "No media playing");
+    lv_label_set_text(labelHeaderStatus, "");
+    lv_bar_set_value(barDashCpu, 0, LV_ANIM_OFF);
+    lv_bar_set_value(barDashGpu, 0, LV_ANIM_OFF);
+    lv_bar_set_value(barDashRam, 0, LV_ANIM_OFF);
+    lv_label_set_text(labelDashCpuValue, "0.0% | N/A");
+    lv_label_set_text(labelDashGpuValue, "N/A");
+    lv_label_set_text(labelDashRamValue, "0.0% | 0.00/0.00 GB");
+    lv_label_set_text(labelDashNetValue, "Down: 0 B/s | Up: 0 B/s");
     return;
   }
 
-  lv_label_set_text(labelHeaderStatus, "Live");
+  lv_label_set_text(labelHeaderStatus, "");
 
-  lv_bar_set_value(barCpu, (int)clampFloat(gStats.cpuPercent, 0.0f, 100.0f), LV_ANIM_OFF);
-  snprintf(line, sizeof(line), "%.1f%%", gStats.cpuPercent);
-  lv_label_set_text(labelCpuValue, line);
-
-  lv_bar_set_value(barRam, (int)clampFloat(gStats.ramUsedPercent, 0.0f, 100.0f), LV_ANIM_OFF);
-  snprintf(line, sizeof(line), "%.1f%%", gStats.ramUsedPercent);
-  lv_label_set_text(labelRamValue, line);
-
-  float displayTemp = gStats.cpuTempAvailable ? gStats.cpuTempC : gStats.gpuTempC;
-  if (displayTemp >= 0.0f) {
-    lv_bar_set_value(barTemp, (int)clampFloat(displayTemp, 0.0f, 100.0f), LV_ANIM_OFF);
-    snprintf(line, sizeof(line), "%.1f C", displayTemp);
-    lv_label_set_text(labelTempValue, line);
+  lv_bar_set_value(barDashCpu, (int)clampFloat(gStats.cpuPercent, 0.0f, 100.0f), LV_ANIM_OFF);
+  if (gStats.cpuTempAvailable) {
+    snprintf(line, sizeof(line), "%.1f%% | %.1f C", gStats.cpuPercent, gStats.cpuTempC);
   } else {
-    lv_bar_set_value(barTemp, 0, LV_ANIM_OFF);
-    lv_label_set_text(labelTempValue, "N/A");
+    snprintf(line, sizeof(line), "%.1f%% | N/A", gStats.cpuPercent);
   }
+  lv_label_set_text(labelDashCpuValue, line);
 
-  lv_label_set_text(labelDashNowState, gStats.mediaPlaybackState);
-  if (gStats.mediaAvailable) {
-    snprintf(line, sizeof(line), "%s - %s", gStats.mediaTitle, gStats.mediaArtist);
-    lv_label_set_text(labelDashNowPlaying, line);
+  if (gStats.gpuAvailable) {
+    lv_bar_set_value(barDashGpu, (int)clampFloat(gStats.gpuUsagePercent, 0.0f, 100.0f), LV_ANIM_OFF);
+    snprintf(line, sizeof(line), "%.1f%% | %.1f C", gStats.gpuUsagePercent, gStats.gpuTempC);
   } else {
-    lv_label_set_text(labelDashNowPlaying, "No media playing");
+    lv_bar_set_value(barDashGpu, 0, LV_ANIM_OFF);
+    snprintf(line, sizeof(line), "N/A");
   }
+  lv_label_set_text(labelDashGpuValue, line);
+
+  lv_bar_set_value(barDashRam, (int)clampFloat(gStats.ramUsedPercent, 0.0f, 100.0f), LV_ANIM_OFF);
+  snprintf(line, sizeof(line), "%.1f%% | %.2f/%.2f GB", gStats.ramUsedPercent, gStats.ramUsedGb, gStats.ramTotalGb);
+  lv_label_set_text(labelDashRamValue, line);
+
+  char downText[24];
+  char upText[24];
+  formatSpeed(downText, sizeof(downText), gDownloadBytesPerSec);
+  formatSpeed(upText, sizeof(upText), gUploadBytesPerSec);
+  snprintf(line, sizeof(line), "Down: %s | Up: %s", downText, upText);
+  lv_label_set_text(labelDashNetValue, line);
 
   snprintf(line, sizeof(line), "CPU: %.1f%%", gStats.cpuPercent);
   lv_label_set_text(labelSystemCpu, line);
@@ -557,11 +794,27 @@ void refreshUiFromStats() {
   }
   lv_label_set_text(labelSystemCpuTemp, line);
 
-  snprintf(line, sizeof(line), "RAM: %.1f%% | %.2f/%.2f GB", gStats.ramUsedPercent, gStats.ramUsedGb, gStats.ramTotalGb);
+  snprintf(line, sizeof(line), "RAM: %.1f%% | U:%.2f A:%.2f T:%.2f GB", gStats.ramUsedPercent, gStats.ramUsedGb, gStats.ramAvailableGb, gStats.ramTotalGb);
   lv_label_set_text(labelSystemRam, line);
 
-  snprintf(line, sizeof(line), "Disk: %.1f%% | %.2f/%.2f GB", gStats.diskUsedPercent, gStats.diskUsedGb, gStats.diskTotalGb);
+  if (gStats.gpuAvailable) {
+    snprintf(line, sizeof(line), "GPU: %.1f%% | %.1f C / %.1f F", gStats.gpuUsagePercent, gStats.gpuTempC, gStats.gpuTempF);
+  } else {
+    snprintf(line, sizeof(line), "GPU: unavailable");
+  }
+  lv_label_set_text(labelSystemGpu, line);
+
+  snprintf(line, sizeof(line), "VRAM: %.1f/%.1f MB (%.1f%%)", gStats.gpuVramUsedMb, gStats.gpuVramTotalMb, gStats.gpuVramUsedPercent);
+  lv_label_set_text(labelSystemGpuVram, line);
+
+  snprintf(line, sizeof(line), "Disk: %.1f%% | U:%.2f F:%.2f T:%.2f GB", gStats.diskUsedPercent, gStats.diskUsedGb, gStats.diskFreeGb, gStats.diskTotalGb);
   lv_label_set_text(labelSystemDisk, line);
+
+  snprintf(line, sizeof(line), "Net Bytes S/R: %llu / %llu", (unsigned long long)gStats.bytesSent, (unsigned long long)gStats.bytesReceived);
+  lv_label_set_text(labelSystemNetBytes, line);
+
+  snprintf(line, sizeof(line), "Net Packets S/R: %llu / %llu", (unsigned long long)gStats.packetsSent, (unsigned long long)gStats.packetsReceived);
+  lv_label_set_text(labelSystemNetPackets, line);
 
   snprintf(line, sizeof(line), "API: %s | ts: %s", gStats.apiStatus, gStats.timestamp);
   lv_label_set_text(labelSystemApi, line);
@@ -601,7 +854,7 @@ void connectToWiFi() {
     return;
   }
 
-  lv_label_set_text(labelHeaderStatus, "WiFi connecting...");
+  lv_label_set_text(labelHeaderStatus, "");
   Serial.print("[WiFi] Connecting to ");
   Serial.println(WIFI_SSID);
 
@@ -619,17 +872,20 @@ void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("[WiFi] Connected. IP: ");
     Serial.println(WiFi.localIP());
-    lv_label_set_text(labelHeaderStatus, "WiFi connected");
+    lv_label_set_text(labelHeaderStatus, "");
   } else {
     Serial.println("[WiFi] Connection timeout.");
-    lv_label_set_text(labelHeaderStatus, "WiFi offline");
+    lv_label_set_text(labelHeaderStatus, "");
   }
 }
 
 // -------------------- API --------------------
 void fetchStats() {
   if (WiFi.status() != WL_CONNECTED) {
-    lv_label_set_text(labelHeaderStatus, "WiFi offline");
+    lv_label_set_text(labelHeaderStatus, "");
+    gUploadBytesPerSec = 0.0f;
+    gDownloadBytesPerSec = 0.0f;
+    prevNetSampleMs = 0;
     gStats.valid = false;
     refreshPending = true;
     return;
@@ -640,7 +896,7 @@ void fetchStats() {
   http.setTimeout(4500);
 
   if (!http.begin(SERVER_URL)) {
-    lv_label_set_text(labelHeaderStatus, "HTTP init error");
+    lv_label_set_text(labelHeaderStatus, "");
     gStats.valid = false;
     refreshPending = true;
     http.end();
@@ -651,7 +907,7 @@ void fetchStats() {
   if (httpCode <= 0) {
     Serial.print("[HTTP] Request failed: ");
     Serial.println(http.errorToString(httpCode));
-    lv_label_set_text(labelHeaderStatus, "Server unreachable");
+    lv_label_set_text(labelHeaderStatus, "");
     gStats.valid = false;
     refreshPending = true;
     http.end();
@@ -661,7 +917,7 @@ void fetchStats() {
   if (httpCode != HTTP_CODE_OK) {
     Serial.print("[HTTP] Status: ");
     Serial.println(httpCode);
-    lv_label_set_text(labelHeaderStatus, "Server error");
+    lv_label_set_text(labelHeaderStatus, "");
     gStats.valid = false;
     refreshPending = true;
     http.end();
@@ -676,7 +932,7 @@ void fetchStats() {
   if (err) {
     Serial.print("[JSON] Parse failed: ");
     Serial.println(err.c_str());
-    lv_label_set_text(labelHeaderStatus, "JSON parse error");
+    lv_label_set_text(labelHeaderStatus, "");
     gStats.valid = false;
     refreshPending = true;
     return;
@@ -684,7 +940,7 @@ void fetchStats() {
 
   JsonObject data = doc["data"].as<JsonObject>();
   if (data.isNull()) {
-    lv_label_set_text(labelHeaderStatus, "Invalid payload");
+    lv_label_set_text(labelHeaderStatus, "");
     gStats.valid = false;
     refreshPending = true;
     return;
@@ -726,6 +982,20 @@ void fetchStats() {
   gStats.bytesReceived = network["bytes_received"] | (uint64_t)0;
   gStats.packetsSent = network["packets_sent"] | (uint64_t)0;
   gStats.packetsReceived = network["packets_received"] | (uint64_t)0;
+
+  unsigned long nowMs = millis();
+  if (prevNetSampleMs > 0 && nowMs > prevNetSampleMs) {
+    float dtSec = (float)(nowMs - prevNetSampleMs) / 1000.0f;
+    if (dtSec > 0.0f) {
+      uint64_t sentDelta = (gStats.bytesSent >= prevBytesSent) ? (gStats.bytesSent - prevBytesSent) : 0;
+      uint64_t recvDelta = (gStats.bytesReceived >= prevBytesReceived) ? (gStats.bytesReceived - prevBytesReceived) : 0;
+      gUploadBytesPerSec = (float)sentDelta / dtSec;
+      gDownloadBytesPerSec = (float)recvDelta / dtSec;
+    }
+  }
+  prevBytesSent = gStats.bytesSent;
+  prevBytesReceived = gStats.bytesReceived;
+  prevNetSampleMs = nowMs;
 
   JsonObject media = data["media"].as<JsonObject>();
   gStats.mediaAvailable = media["available"] | false;
