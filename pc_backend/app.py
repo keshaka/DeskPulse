@@ -45,6 +45,13 @@ except Exception as e:
     GPU_AVAILABLE = False
     logger.warning(f"NVIDIA GPU monitoring not available: {e}")
 
+# Media monitoring imports (all Windows-based, optional)
+try:
+    from ctypes import windll, Structure, POINTER, c_void_p, c_wchar, c_uint32
+    WINDOWS_MEDIA_API_AVAILABLE = True
+except ImportError:
+    WINDOWS_MEDIA_API_AVAILABLE = False
+
 
 # ==================== SYSTEM MONITORING FUNCTIONS ====================
 
@@ -293,6 +300,108 @@ def get_gpu_info():
     return gpu_data
 
 
+def get_media_info():
+    """
+    Get currently playing media information from Windows media sessions.
+    Detects media from Spotify, Windows Media Player, and other players.
+    
+    Returns:
+        dict: {
+            "title": str or None,
+            "artist": str or None,
+            "playback_state": "playing" | "paused" | "unknown",
+            "available": bool,
+            "player": str or None (name of detected player)
+        }
+    """
+    media_data = {
+        "title": None,
+        "artist": None,
+        "playback_state": "unknown",
+        "available": False,
+        "player": None
+    }
+    
+    try:
+        # First, try to detect Spotify through its window title
+        # Spotify updates window title with "Now Playing" format
+        if WINDOWS_MEDIA_API_AVAILABLE:
+            try:
+                import win32gui
+                import win32api
+                
+                # Look for Spotify window
+                hwnds = []
+                win32gui.EnumWindows(
+                    lambda hwnd, param: param.append(hwnd) 
+                    if "spotify" in win32gui.GetWindowText(hwnd).lower() 
+                    else None, 
+                    hwnds
+                )
+                
+                if hwnds:
+                    for hwnd in hwnds:
+                        title = win32gui.GetWindowText(hwnd)
+                        # Spotify window title format: "Song - Artist - Spotify"
+                        if " - " in title and title.lower().endswith("spotify"):
+                            parts = title.split(" - ")
+                            if len(parts) >= 2:
+                                media_data["title"] = parts[0].strip()
+                                media_data["artist"] = parts[1].strip()
+                                media_data["playback_state"] = "playing"
+                                media_data["player"] = "Spotify"
+                                media_data["available"] = True
+                                return media_data
+                        elif "spotify" in title.lower():
+                            # Paused or other state
+                            media_data["playback_state"] = "paused"
+                            media_data["player"] = "Spotify"
+                            media_data["available"] = True
+                            return media_data
+            except Exception as e:
+                logger.debug(f"Error detecting Spotify: {e}")
+        
+        # Check Windows Media Player via WMI
+        if WMI_AVAILABLE:
+            try:
+                w = wmi.WMI(namespace="root\\cimv2")
+                # Look for Windows Media Player process with active media
+                procs = w.query("SELECT * FROM Win32_Process WHERE name='wmplayer.exe'")
+                
+                if procs:
+                    media_data["player"] = "Windows Media Player"
+                    media_data["available"] = True
+                    media_data["playback_state"] = "playing"
+                    # Note: Detailed metadata requires COM interface
+                    return media_data
+            except Exception as e:
+                logger.debug(f"Error detecting Windows Media Player: {e}")
+        
+        # Check for other common players
+        common_players = [
+            ("spotify.exe", "Spotify"),
+            ("vlc.exe", "VLC"),
+            ("mpv.exe", "MPV"),
+            ("foobar2000.exe", "Foobar2000"),
+        ]
+        
+        running_processes = {p.name().lower() for p in psutil.process_iter(['name'])}
+        
+        for proc_name, player_name in common_players:
+            if proc_name in running_processes:
+                media_data["player"] = player_name
+                media_data["available"] = True
+                # Default to playing state if player is running
+                media_data["playback_state"] = "playing"
+                logger.debug(f"Detected media player: {player_name}")
+                break
+        
+    except Exception as e:
+        logger.debug(f"Error reading media info: {e}")
+    
+    return media_data
+
+
 def get_system_stats():
     """
     Collect all system statistics in a lightweight format.
@@ -306,7 +415,8 @@ def get_system_stats():
         "ram": get_ram_usage(),
         "gpu": get_gpu_info(),
         "disk": get_disk_usage(),
-        "network": get_network_usage()
+        "network": get_network_usage(),
+        "media": get_media_info()
     }
 
 
