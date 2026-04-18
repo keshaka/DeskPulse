@@ -9,12 +9,13 @@ Author: DeskPulse Project
 Version: 1.0.0
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import logging
 from datetime import datetime
 import psutil
 import platform
+import subprocess
 
 # Initialize Flask application
 app = Flask(__name__)
@@ -724,6 +725,175 @@ def volume_down():
         return jsonify({
             "status": "error",
             "action": "volume_down",
+            "message": str(e)
+        }), 500
+
+
+# ==================== SYSTEM CONTROL ENDPOINTS ====================
+
+def is_windows_platform():
+    """Return True when running on Windows."""
+    return platform.system().lower() == "windows"
+
+
+def confirmation_valid(expected_token):
+    """
+    Validate safety confirmation token from JSON body or query string.
+
+    Accepts either:
+    - JSON body: {"confirm": "TOKEN"}
+    - Query string: ?confirm=TOKEN
+    """
+    payload = request.get_json(silent=True) or {}
+    confirm_value = str(payload.get("confirm", "")).strip().upper()
+
+    if not confirm_value:
+        confirm_value = str(request.args.get("confirm", "")).strip().upper()
+
+    return confirm_value == expected_token
+
+
+def parse_delay_seconds(default_value=15, max_value=300):
+    """
+    Parse delayed shutdown/restart timer from request body or query.
+    """
+    payload = request.get_json(silent=True) or {}
+    delay = payload.get("delay_seconds", request.args.get("delay_seconds", default_value))
+
+    try:
+        delay = int(delay)
+    except (TypeError, ValueError):
+        delay = default_value
+
+    if delay < 0:
+        delay = 0
+    if delay > max_value:
+        delay = max_value
+
+    return delay
+
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown_system():
+    """
+    Shutdown the Windows system after a short safety delay.
+
+    Required confirmation:
+    - JSON: {"confirm": "SHUTDOWN"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "shutdown",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("SHUTDOWN"):
+        return jsonify({
+            "status": "error",
+            "action": "shutdown",
+            "message": "Confirmation required. Send confirm=SHUTDOWN in JSON body or query."
+        }), 400
+
+    try:
+        delay_seconds = parse_delay_seconds(default_value=15, max_value=300)
+        subprocess.run(["shutdown", "/s", "/t", str(delay_seconds)], check=True)
+
+        return jsonify({
+            "status": "ok",
+            "action": "shutdown",
+            "message": f"Shutdown scheduled in {delay_seconds} seconds.",
+            "delay_seconds": delay_seconds
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in shutdown endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "shutdown",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/restart', methods=['POST'])
+def restart_system():
+    """
+    Restart the Windows system after a short safety delay.
+
+    Required confirmation:
+    - JSON: {"confirm": "RESTART"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "restart",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("RESTART"):
+        return jsonify({
+            "status": "error",
+            "action": "restart",
+            "message": "Confirmation required. Send confirm=RESTART in JSON body or query."
+        }), 400
+
+    try:
+        delay_seconds = parse_delay_seconds(default_value=15, max_value=300)
+        subprocess.run(["shutdown", "/r", "/t", str(delay_seconds)], check=True)
+
+        return jsonify({
+            "status": "ok",
+            "action": "restart",
+            "message": f"Restart scheduled in {delay_seconds} seconds.",
+            "delay_seconds": delay_seconds
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in restart endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "restart",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/lock', methods=['POST'])
+def lock_system():
+    """
+    Lock the current Windows session.
+
+    Required confirmation:
+    - JSON: {"confirm": "LOCK"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "lock",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("LOCK"):
+        return jsonify({
+            "status": "error",
+            "action": "lock",
+            "message": "Confirmation required. Send confirm=LOCK in JSON body or query."
+        }), 400
+
+    try:
+        import ctypes
+        result = ctypes.windll.user32.LockWorkStation()
+
+        if result == 0:
+            raise RuntimeError("Windows rejected the lock request")
+
+        return jsonify({
+            "status": "ok",
+            "action": "lock",
+            "message": "System lock command sent"
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in lock endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "lock",
             "message": str(e)
         }), 500
 
