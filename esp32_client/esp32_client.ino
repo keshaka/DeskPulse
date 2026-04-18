@@ -1,47 +1,212 @@
 /*
-  DeskPulse ESP32 Client (ESP32-2432S028)
-  ---------------------------------------
+  DeskPulse ESP32 Client with LVGL UI (ESP32-2432S028)
+  -----------------------------------------------------
   Features:
   - Connects to WiFi
-  - Sends HTTP GET to Flask /stats endpoint
+  - Fetches /stats from Flask server
   - Parses JSON with ArduinoJson
-  - Prints parsed values to Serial Monitor
-  - Handles WiFi and HTTP errors gracefully
+  - Displays CPU, RAM, Temperature using LVGL labels and bars
+  - Prints values to Serial Monitor
+  - Handles connection and parsing errors gracefully
 
   Required libraries:
-  - ArduinoJson (by Benoit Blanchon)
+  - ArduinoJson
+  - lvgl
+  - TFT_eSPI
 
-  Notes:
-  - Update WIFI_SSID, WIFI_PASSWORD, and SERVER_URL below.
-  - Example SERVER_URL: http://192.168.1.100:5000/stats
+  Required TFT_eSPI setup:
+  - Configure User_Setup for ESP32-2432S028 (ILI9341, 320x240)
 */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <lvgl.h>
+#include <TFT_eSPI.h>
 
 // -------------------- User Configuration --------------------
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-// Use your PC local IP address and Flask port.
 const char* SERVER_URL = "http://192.168.1.100:5000/stats";
 
-// Poll every 2 seconds.
 const unsigned long POLL_INTERVAL_MS = 2000;
-
-// WiFi connection timeout.
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+
+// -------------------- Display / LVGL --------------------
+static const uint16_t SCREEN_WIDTH = 320;
+static const uint16_t SCREEN_HEIGHT = 240;
+static const uint32_t DRAW_BUF_PIXELS = SCREEN_WIDTH * 20;
+
+TFT_eSPI tft = TFT_eSPI();
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf[DRAW_BUF_PIXELS];
+static lv_disp_drv_t disp_drv;
 
 // -------------------- Runtime State --------------------
 unsigned long lastPollMs = 0;
+float cpuPercent = 0.0f;
+float ramPercent = 0.0f;
+float tempCelsius = -1.0f;
+bool statsValid = false;
 
-// -------------------- Helper Functions --------------------
+// -------------------- UI Objects --------------------
+lv_obj_t* labelStatus;
+
+lv_obj_t* labelCpuTitle;
+lv_obj_t* barCpu;
+lv_obj_t* labelCpuValue;
+
+lv_obj_t* labelRamTitle;
+lv_obj_t* barRam;
+lv_obj_t* labelRamValue;
+
+lv_obj_t* labelTempTitle;
+lv_obj_t* barTemp;
+lv_obj_t* labelTempValue;
+
+// -------------------- LVGL Helpers --------------------
+void myDispFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint32_t width = (area->x2 - area->x1 + 1);
+  uint32_t height = (area->y2 - area->y1 + 1);
+
+  tft.startWrite();
+  tft.setAddrWindow(area->x1, area->y1, width, height);
+  tft.pushColors((uint16_t*)&color_p->full, width * height, true);
+  tft.endWrite();
+
+  lv_disp_flush_ready(disp);
+}
+
+void initLvglDisplay() {
+  lv_init();
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, DRAW_BUF_PIXELS);
+
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = SCREEN_WIDTH;
+  disp_drv.ver_res = SCREEN_HEIGHT;
+  disp_drv.flush_cb = myDispFlush;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+}
+
+void styleBar(lv_obj_t* barObj, lv_color_t color) {
+  lv_obj_set_height(barObj, 14);
+  lv_obj_set_style_bg_color(barObj, lv_color_hex(0x2C2F33), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(barObj, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(barObj, 8, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(barObj, color, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(barObj, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(barObj, 8, LV_PART_INDICATOR);
+}
+
+void createUi() {
+  lv_obj_t* scr = lv_scr_act();
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x101214), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(scr, 10, LV_PART_MAIN);
+
+  labelStatus = lv_label_create(scr);
+  lv_label_set_text(labelStatus, "DeskPulse | Connecting...");
+  lv_obj_set_style_text_color(labelStatus, lv_color_hex(0xE6EDF3), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelStatus, &lv_font_montserrat_14, LV_PART_MAIN);
+  lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  // CPU row
+  labelCpuTitle = lv_label_create(scr);
+  lv_label_set_text(labelCpuTitle, "CPU");
+  lv_obj_set_style_text_color(labelCpuTitle, lv_color_hex(0x8B949E), LV_PART_MAIN);
+  lv_obj_align(labelCpuTitle, LV_ALIGN_TOP_LEFT, 0, 34);
+
+  labelCpuValue = lv_label_create(scr);
+  lv_label_set_text(labelCpuValue, "0.0%");
+  lv_obj_set_style_text_color(labelCpuValue, lv_color_hex(0xE6EDF3), LV_PART_MAIN);
+  lv_obj_align(labelCpuValue, LV_ALIGN_TOP_RIGHT, 0, 34);
+
+  barCpu = lv_bar_create(scr);
+  lv_obj_set_width(barCpu, 300);
+  lv_obj_align(barCpu, LV_ALIGN_TOP_LEFT, 0, 56);
+  lv_bar_set_range(barCpu, 0, 100);
+  styleBar(barCpu, lv_color_hex(0x2EA043));
+
+  // RAM row
+  labelRamTitle = lv_label_create(scr);
+  lv_label_set_text(labelRamTitle, "RAM");
+  lv_obj_set_style_text_color(labelRamTitle, lv_color_hex(0x8B949E), LV_PART_MAIN);
+  lv_obj_align(labelRamTitle, LV_ALIGN_TOP_LEFT, 0, 84);
+
+  labelRamValue = lv_label_create(scr);
+  lv_label_set_text(labelRamValue, "0.0%");
+  lv_obj_set_style_text_color(labelRamValue, lv_color_hex(0xE6EDF3), LV_PART_MAIN);
+  lv_obj_align(labelRamValue, LV_ALIGN_TOP_RIGHT, 0, 84);
+
+  barRam = lv_bar_create(scr);
+  lv_obj_set_width(barRam, 300);
+  lv_obj_align(barRam, LV_ALIGN_TOP_LEFT, 0, 106);
+  lv_bar_set_range(barRam, 0, 100);
+  styleBar(barRam, lv_color_hex(0x1F6FEB));
+
+  // Temperature row
+  labelTempTitle = lv_label_create(scr);
+  lv_label_set_text(labelTempTitle, "TEMP");
+  lv_obj_set_style_text_color(labelTempTitle, lv_color_hex(0x8B949E), LV_PART_MAIN);
+  lv_obj_align(labelTempTitle, LV_ALIGN_TOP_LEFT, 0, 134);
+
+  labelTempValue = lv_label_create(scr);
+  lv_label_set_text(labelTempValue, "--.- C");
+  lv_obj_set_style_text_color(labelTempValue, lv_color_hex(0xE6EDF3), LV_PART_MAIN);
+  lv_obj_align(labelTempValue, LV_ALIGN_TOP_RIGHT, 0, 134);
+
+  barTemp = lv_bar_create(scr);
+  lv_obj_set_width(barTemp, 300);
+  lv_obj_align(barTemp, LV_ALIGN_TOP_LEFT, 0, 156);
+  lv_bar_set_range(barTemp, 0, 100);
+  styleBar(barTemp, lv_color_hex(0xDB6D28));
+}
+
+void refreshUi() {
+  char text[32];
+
+  if (!statsValid) {
+    lv_label_set_text(labelStatus, "DeskPulse | Waiting for data...");
+    return;
+  }
+
+  lv_label_set_text(labelStatus, "DeskPulse | Live");
+
+  lv_bar_set_value(barCpu, (int)cpuPercent, LV_ANIM_ON);
+  snprintf(text, sizeof(text), "%.1f%%", cpuPercent);
+  lv_label_set_text(labelCpuValue, text);
+
+  lv_bar_set_value(barRam, (int)ramPercent, LV_ANIM_ON);
+  snprintf(text, sizeof(text), "%.1f%%", ramPercent);
+  lv_label_set_text(labelRamValue, text);
+
+  if (tempCelsius >= 0.0f) {
+    int tempBar = (int)tempCelsius;
+    if (tempBar > 100) {
+      tempBar = 100;
+    }
+    lv_bar_set_value(barTemp, tempBar, LV_ANIM_ON);
+    snprintf(text, sizeof(text), "%.1f C", tempCelsius);
+    lv_label_set_text(labelTempValue, text);
+  } else {
+    lv_bar_set_value(barTemp, 0, LV_ANIM_ON);
+    lv_label_set_text(labelTempValue, "N/A");
+  }
+}
+
+// -------------------- Connectivity --------------------
 void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     return;
   }
 
+  lv_label_set_text(labelStatus, "DeskPulse | Connecting WiFi...");
   Serial.print("[WiFi] Connecting to ");
   Serial.println(WIFI_SSID);
 
@@ -49,9 +214,9 @@ void connectToWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long startMs = millis();
-
   while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(400);
+    delay(300);
+    lv_timer_handler();
     Serial.print(".");
   }
   Serial.println();
@@ -59,19 +224,19 @@ void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("[WiFi] Connected. IP: ");
     Serial.println(WiFi.localIP());
+    lv_label_set_text(labelStatus, "DeskPulse | WiFi connected");
   } else {
-    Serial.println("[WiFi] Connection failed (timeout). Will retry in loop.");
+    Serial.println("[WiFi] Connection failed. Retrying later.");
+    lv_label_set_text(labelStatus, "DeskPulse | WiFi offline");
   }
 }
 
-void printMissingField(const char* fieldName) {
-  Serial.print("[JSON] Missing field: ");
-  Serial.println(fieldName);
-}
-
-void fetchAndPrintStats() {
+// -------------------- API --------------------
+void fetchStats() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[HTTP] Skipped: WiFi not connected.");
+    lv_label_set_text(labelStatus, "DeskPulse | WiFi offline");
+    statsValid = false;
     return;
   }
 
@@ -79,30 +244,29 @@ void fetchAndPrintStats() {
   http.setConnectTimeout(5000);
   http.setTimeout(5000);
 
-  Serial.print("[HTTP] GET ");
-  Serial.println(SERVER_URL);
-
   if (!http.begin(SERVER_URL)) {
-    Serial.println("[HTTP] Failed to initialize request.");
+    Serial.println("[HTTP] Request init failed.");
+    lv_label_set_text(labelStatus, "DeskPulse | HTTP init error");
+    statsValid = false;
     http.end();
     return;
   }
 
   int httpCode = http.GET();
-
   if (httpCode <= 0) {
-    Serial.print("[HTTP] Request failed. Error: ");
+    Serial.print("[HTTP] Request failed: ");
     Serial.println(http.errorToString(httpCode));
+    lv_label_set_text(labelStatus, "DeskPulse | Server unreachable");
+    statsValid = false;
     http.end();
     return;
   }
 
   if (httpCode != HTTP_CODE_OK) {
-    Serial.print("[HTTP] Unexpected response code: ");
+    Serial.print("[HTTP] Unexpected status: ");
     Serial.println(httpCode);
-    String errorBody = http.getString();
-    Serial.print("[HTTP] Response body: ");
-    Serial.println(errorBody);
+    lv_label_set_text(labelStatus, "DeskPulse | Server error");
+    statsValid = false;
     http.end();
     return;
   }
@@ -110,138 +274,80 @@ void fetchAndPrintStats() {
   String payload = http.getString();
   http.end();
 
-  // Keep this reasonably sized for ESP32 memory.
   DynamicJsonDocument doc(4096);
   DeserializationError err = deserializeJson(doc, payload);
-
   if (err) {
     Serial.print("[JSON] Parse failed: ");
     Serial.println(err.c_str());
+    lv_label_set_text(labelStatus, "DeskPulse | JSON parse error");
+    statsValid = false;
     return;
   }
 
-  // Expected shape from Flask:
-  // {
-  //   "status": "ok",
-  //   "data": { ... }
-  // }
-
-  const char* status = doc["status"] | "unknown";
   JsonObject data = doc["data"].as<JsonObject>();
-
   if (data.isNull()) {
-    Serial.println("[JSON] Invalid payload: 'data' object not found.");
+    Serial.println("[JSON] Missing data object.");
+    lv_label_set_text(labelStatus, "DeskPulse | Invalid payload");
+    statsValid = false;
     return;
   }
 
-  Serial.println("---------------- DeskPulse Stats ----------------");
-  Serial.print("status: ");
-  Serial.println(status);
+  cpuPercent = data["cpu_percent"] | 0.0f;
 
-  // CPU
-  if (data["cpu_percent"].isNull()) {
-    printMissingField("data.cpu_percent");
+  JsonObject ramObj = data["ram"].as<JsonObject>();
+  ramPercent = ramObj["used_percent"] | 0.0f;
+
+  // Temperature preference: CPU temp first, fallback to GPU temp.
+  tempCelsius = -1.0f;
+  JsonObject cpuTempObj = data["cpu_temp"].as<JsonObject>();
+  if (!cpuTempObj.isNull()) {
+    bool cpuTempAvailable = cpuTempObj["available"] | false;
+    if (cpuTempAvailable) {
+      tempCelsius = cpuTempObj["celsius"] | -1.0f;
+    }
   }
-  float cpuPercent = data["cpu_percent"] | -1.0f;
+
+  if (tempCelsius < 0.0f) {
+    JsonObject gpuObj = data["gpu"].as<JsonObject>();
+    if (!gpuObj.isNull()) {
+      tempCelsius = gpuObj["temperature_celsius"] | -1.0f;
+    }
+  }
+
+  statsValid = true;
+
+  Serial.println("------ DeskPulse ------");
   Serial.print("CPU: ");
   Serial.print(cpuPercent, 1);
   Serial.println(" %");
-
-  // RAM
-  JsonObject ram = data["ram"].as<JsonObject>();
-  if (ram.isNull()) {
-    printMissingField("data.ram");
-  }
-  float ramUsedPercent = ram["used_percent"] | -1.0f;
   Serial.print("RAM: ");
-  Serial.print(ramUsedPercent, 1);
+  Serial.print(ramPercent, 1);
   Serial.println(" %");
-
-  // Disk
-  JsonObject disk = data["disk"].as<JsonObject>();
-  if (disk.isNull()) {
-    printMissingField("data.disk");
+  Serial.print("Temp: ");
+  if (tempCelsius >= 0.0f) {
+    Serial.print(tempCelsius, 1);
+    Serial.println(" C");
+  } else {
+    Serial.println("N/A");
   }
-  float diskUsedPercent = disk["used_percent"] | -1.0f;
-  Serial.print("Disk: ");
-  Serial.print(diskUsedPercent, 1);
-  Serial.println(" %");
-
-  // Network
-  JsonObject network = data["network"].as<JsonObject>();
-  if (network.isNull()) {
-    printMissingField("data.network");
-  }
-  unsigned long long bytesSent = network["bytes_sent"] | 0ULL;
-  unsigned long long bytesReceived = network["bytes_received"] | 0ULL;
-  Serial.print("Network bytes sent: ");
-  Serial.println(bytesSent);
-  Serial.print("Network bytes received: ");
-  Serial.println(bytesReceived);
-
-  // GPU (optional)
-  JsonObject gpu = data["gpu"].as<JsonObject>();
-  if (!gpu.isNull()) {
-    bool gpuAvailable = gpu["available"] | false;
-    Serial.print("GPU available: ");
-    Serial.println(gpuAvailable ? "yes" : "no");
-
-    float gpuUsage = gpu["gpu_usage_percent"] | -1.0f;
-    if (gpuUsage >= 0.0f) {
-      Serial.print("GPU usage: ");
-      Serial.print(gpuUsage, 1);
-      Serial.println(" %");
-    }
-  }
-
-  // Temperatures (optional)
-  JsonObject cpuTemp = data["cpu_temp"].as<JsonObject>();
-  if (!cpuTemp.isNull()) {
-    bool cpuTempAvailable = cpuTemp["available"] | false;
-    if (cpuTempAvailable) {
-      float tempC = cpuTemp["celsius"] | -999.0f;
-      Serial.print("CPU temp: ");
-      Serial.print(tempC, 1);
-      Serial.println(" C");
-    } else {
-      Serial.println("CPU temp: unavailable");
-    }
-  }
-
-  // Media (optional)
-  JsonObject media = data["media"].as<JsonObject>();
-  if (!media.isNull()) {
-    const char* title = media["title"] | "";
-    const char* artist = media["artist"] | "";
-    const char* playbackState = media["playback_state"] | "unknown";
-
-    Serial.print("Media state: ");
-    Serial.println(playbackState);
-
-    if (strlen(title) > 0 || strlen(artist) > 0) {
-      Serial.print("Now playing: ");
-      Serial.print(title);
-      Serial.print(" - ");
-      Serial.println(artist);
-    }
-  }
-
-  Serial.println("-------------------------------------------------");
 }
 
-// -------------------- Arduino Entry Points --------------------
+// -------------------- Arduino Entry --------------------
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(200);
 
-  Serial.println();
-  Serial.println("DeskPulse ESP32 client starting...");
+  initLvglDisplay();
+  createUi();
+  refreshUi();
 
   connectToWiFi();
 }
 
 void loop() {
-  // Auto-reconnect if disconnected.
+  lv_timer_handler();
+  delay(5);
+
   if (WiFi.status() != WL_CONNECTED) {
     connectToWiFi();
   }
@@ -249,8 +355,7 @@ void loop() {
   unsigned long nowMs = millis();
   if (nowMs - lastPollMs >= POLL_INTERVAL_MS) {
     lastPollMs = nowMs;
-    fetchAndPrintStats();
+    fetchStats();
+    refreshUi();
   }
-
-  delay(10);
 }
