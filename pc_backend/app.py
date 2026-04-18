@@ -16,6 +16,7 @@ from datetime import datetime
 import psutil
 import platform
 import subprocess
+import asyncio
 
 # Initialize Flask application
 app = Flask(__name__)
@@ -52,6 +53,23 @@ try:
     WINDOWS_MEDIA_API_AVAILABLE = True
 except ImportError:
     WINDOWS_MEDIA_API_AVAILABLE = False
+
+try:
+    from winsdk.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+    )
+    WINDOWS_GSMTC_AVAILABLE = True
+except Exception:
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+        )
+        WINDOWS_GSMTC_AVAILABLE = True
+    except Exception:
+        WINDOWS_GSMTC_AVAILABLE = False
+        logger.warning("Windows media control API not available - browser media detection may be limited")
 
 # Media control imports
 try:
@@ -331,27 +349,132 @@ def get_media_info():
         "player": None
     }
     
+    def _map_player_name(source_app_id):
+        app = (source_app_id or "").lower()
+        if "chrome" in app:
+            return "Chrome"
+        if "msedge" in app:
+            return "Edge"
+        if "firefox" in app:
+            return "Firefox"
+        if "spotify" in app:
+            return "Spotify"
+        if "vlc" in app:
+            return "VLC"
+        if "wmplayer" in app:
+            return "Windows Media Player"
+        return source_app_id or None
+
+    def _map_playback_state(status):
+        if status == PlaybackStatus.PLAYING:
+            return "playing"
+        if status == PlaybackStatus.PAUSED:
+            return "paused"
+        return "unknown"
+
+    async def _get_media_from_windows_session():
+        manager = await MediaManager.request_async()
+        candidates = []
+
+        try:
+            sessions = list(manager.get_sessions())
+        except Exception:
+            sessions = []
+
+        current = None
+        try:
+            current = manager.get_current_session()
+        except Exception:
+            current = None
+
+        if current is not None and current not in sessions:
+            sessions.insert(0, current)
+
+        for session in sessions:
+            try:
+                playback_info = session.get_playback_info()
+                playback_state = _map_playback_state(playback_info.playback_status)
+            except Exception:
+                playback_state = "unknown"
+
+            source_app_id = None
+            try:
+                source_app_id = session.source_app_user_model_id
+            except Exception:
+                source_app_id = None
+
+            title = None
+            artist = None
+            try:
+                props = await session.try_get_media_properties_async()
+                title = getattr(props, "title", None)
+                artist = getattr(props, "artist", None)
+            except Exception:
+                pass
+
+            score = 0
+            if playback_state == "playing":
+                score += 10
+            if title:
+                score += 4
+            if artist:
+                score += 2
+            if source_app_id:
+                score += 1
+
+            candidates.append({
+                "title": title,
+                "artist": artist,
+                "playback_state": playback_state,
+                "available": bool(title or artist or source_app_id),
+                "player": _map_player_name(source_app_id),
+                "_score": score,
+            })
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        best = candidates[0]
+        best.pop("_score", None)
+        return best
+
     try:
-        # First, try to detect Spotify through its window title
-        # Spotify updates window title with "Now Playing" format
+        # First, use Windows Global System Media Transport Controls (works for browser media sessions).
+        if WINDOWS_GSMTC_AVAILABLE:
+            session_data = None
+            try:
+                session_data = asyncio.run(_get_media_from_windows_session())
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    asyncio.set_event_loop(loop)
+                    session_data = loop.run_until_complete(_get_media_from_windows_session())
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
+            except Exception as e:
+                logger.debug(f"Error reading GSMTC media session: {e}")
+
+            if session_data and session_data.get("available"):
+                return session_data
+            
+        # Fallback: detect Spotify via window title
         if WINDOWS_MEDIA_API_AVAILABLE:
             try:
                 import win32gui
-                import win32api
-                
-                # Look for Spotify window
+
                 hwnds = []
                 win32gui.EnumWindows(
-                    lambda hwnd, param: param.append(hwnd) 
-                    if "spotify" in win32gui.GetWindowText(hwnd).lower() 
-                    else None, 
+                    lambda hwnd, param: param.append(hwnd)
+                    if "spotify" in win32gui.GetWindowText(hwnd).lower()
+                    else None,
                     hwnds
                 )
-                
+
                 if hwnds:
                     for hwnd in hwnds:
                         title = win32gui.GetWindowText(hwnd)
-                        # Spotify window title format: "Song - Artist - Spotify"
                         if " - " in title and title.lower().endswith("spotify"):
                             parts = title.split(" - ")
                             if len(parts) >= 2:
@@ -362,7 +485,6 @@ def get_media_info():
                                 media_data["available"] = True
                                 return media_data
                         elif "spotify" in title.lower():
-                            # Paused or other state
                             media_data["playback_state"] = "paused"
                             media_data["player"] = "Spotify"
                             media_data["available"] = True
@@ -404,6 +526,58 @@ def get_media_info():
                 media_data["playback_state"] = "playing"
                 logger.debug(f"Detected media player: {player_name}")
                 break
+
+        # Browser YouTube fallback using window title.
+        # Example title: "Song Name - YouTube - Google Chrome"
+        if not media_data["available"]:
+            try:
+                import win32gui
+
+                browser_markers = [
+                    ("google chrome", "Chrome"),
+                    ("microsoft edge", "Edge"),
+                    ("mozilla firefox", "Firefox"),
+                ]
+
+                hwnds = []
+                win32gui.EnumWindows(lambda hwnd, param: param.append(hwnd), hwnds)
+
+                for hwnd in hwnds:
+                    title = win32gui.GetWindowText(hwnd).strip()
+                    if not title:
+                        continue
+                    title_l = title.lower()
+                    if "youtube" not in title_l:
+                        continue
+
+                    detected_player = None
+                    for marker, player_name in browser_markers:
+                        if marker in title_l:
+                            detected_player = player_name
+                            break
+
+                    if detected_player is None:
+                        continue
+
+                    cleaned_title = title
+                    for suffix in [
+                        " - YouTube - Google Chrome",
+                        " - YouTube - Microsoft Edge",
+                        " - YouTube - Mozilla Firefox",
+                        " - YouTube",
+                    ]:
+                        if cleaned_title.endswith(suffix):
+                            cleaned_title = cleaned_title[:-len(suffix)].strip()
+                            break
+
+                    media_data["title"] = cleaned_title if cleaned_title else title
+                    media_data["artist"] = None
+                    media_data["player"] = detected_player
+                    media_data["playback_state"] = "playing"
+                    media_data["available"] = True
+                    return media_data
+            except Exception as e:
+                logger.debug(f"Error reading browser YouTube window title: {e}")
         
     except Exception as e:
         logger.debug(f"Error reading media info: {e}")
@@ -894,6 +1068,158 @@ def lock_system():
         return jsonify({
             "status": "error",
             "action": "lock",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/sleep', methods=['POST'])
+def sleep_system():
+    """
+    Put the Windows system to sleep.
+
+    Required confirmation:
+    - JSON: {"confirm": "SLEEP"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "sleep",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("SLEEP"):
+        return jsonify({
+            "status": "error",
+            "action": "sleep",
+            "message": "Confirmation required. Send confirm=SLEEP in JSON body or query."
+        }), 400
+
+    try:
+        subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], check=True)
+        return jsonify({
+            "status": "ok",
+            "action": "sleep",
+            "message": "Sleep command sent"
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in sleep endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "sleep",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/logout', methods=['POST'])
+def logout_system():
+    """
+    Log out the current Windows user session.
+
+    Required confirmation:
+    - JSON: {"confirm": "LOGOUT"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "logout",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("LOGOUT"):
+        return jsonify({
+            "status": "error",
+            "action": "logout",
+            "message": "Confirmation required. Send confirm=LOGOUT in JSON body or query."
+        }), 400
+
+    try:
+        subprocess.run(["shutdown", "/l"], check=True)
+        return jsonify({
+            "status": "ok",
+            "action": "logout",
+            "message": "Logout command sent"
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in logout endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "logout",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/switch_user', methods=['POST'])
+def switch_user_system():
+    """
+    Switch to the Windows logon screen (disconnect current session).
+
+    Required confirmation:
+    - JSON: {"confirm": "SWITCH"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "switch_user",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("SWITCH"):
+        return jsonify({
+            "status": "error",
+            "action": "switch_user",
+            "message": "Confirmation required. Send confirm=SWITCH in JSON body or query."
+        }), 400
+
+    try:
+        subprocess.run(["tsdiscon"], check=True)
+        return jsonify({
+            "status": "ok",
+            "action": "switch_user",
+            "message": "Switch user command sent"
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in switch_user endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "switch_user",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/hibernate', methods=['POST'])
+def hibernate_system():
+    """
+    Hibernate the Windows system.
+
+    Required confirmation:
+    - JSON: {"confirm": "HIBERNATE"}
+    """
+    if not is_windows_platform():
+        return jsonify({
+            "status": "error",
+            "action": "hibernate",
+            "message": "Unsupported platform. Windows only."
+        }), 400
+
+    if not confirmation_valid("HIBERNATE"):
+        return jsonify({
+            "status": "error",
+            "action": "hibernate",
+            "message": "Confirmation required. Send confirm=HIBERNATE in JSON body or query."
+        }), 400
+
+    try:
+        subprocess.run(["shutdown", "/h"], check=True)
+        return jsonify({
+            "status": "ok",
+            "action": "hibernate",
+            "message": "Hibernate command sent"
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in hibernate endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "hibernate",
             "message": str(e)
         }), 500
 

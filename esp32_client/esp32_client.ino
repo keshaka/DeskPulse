@@ -120,7 +120,7 @@ StatsData gStats = {};
 lv_obj_t* tabview;
 lv_obj_t* tabDashboard;
 lv_obj_t* tabSystem;
-lv_obj_t* tabGpuNet;
+lv_obj_t* tabControl;
 lv_obj_t* tabMedia;
 
 // Header / status
@@ -147,11 +147,9 @@ lv_obj_t* labelSystemNetBytes;
 lv_obj_t* labelSystemNetPackets;
 lv_obj_t* labelSystemApi;
 
-// GPU / Network page
-lv_obj_t* labelGpuInfo;
-lv_obj_t* labelGpuVram;
-lv_obj_t* labelNetBytes;
-lv_obj_t* labelNetPackets;
+// Control page
+lv_obj_t* labelControlHint;
+lv_obj_t* labelControlStatus;
 
 // Media page
 lv_obj_t* mediaHeroCard;
@@ -267,6 +265,79 @@ void sendMediaCommand(const char* endpoint) {
 void onMediaControlClicked(lv_event_t* e) {
   const char* endpoint = static_cast<const char*>(lv_event_get_user_data(e));
   sendMediaCommand(endpoint);
+}
+
+const char* getSystemConfirmToken(const char* endpoint) {
+  if (endpoint == nullptr) {
+    return nullptr;
+  }
+  if (strcmp(endpoint, "/shutdown") == 0) return "SHUTDOWN";
+  if (strcmp(endpoint, "/restart") == 0) return "RESTART";
+  if (strcmp(endpoint, "/lock") == 0) return "LOCK";
+  if (strcmp(endpoint, "/sleep") == 0) return "SLEEP";
+  if (strcmp(endpoint, "/logout") == 0) return "LOGOUT";
+  if (strcmp(endpoint, "/switch_user") == 0) return "SWITCH";
+  if (strcmp(endpoint, "/hibernate") == 0) return "HIBERNATE";
+  return nullptr;
+}
+
+void sendSystemCommand(const char* endpoint) {
+  if (WiFi.status() != WL_CONNECTED || endpoint == nullptr || endpoint[0] == '\0') {
+    if (labelControlStatus != nullptr) {
+      lv_label_set_text(labelControlStatus, "Control unavailable");
+    }
+    return;
+  }
+
+  HTTPClient http;
+  String url = getApiBaseUrl() + endpoint;
+  if (!http.begin(url)) {
+    if (labelControlStatus != nullptr) {
+      lv_label_set_text(labelControlStatus, "Request init failed");
+    }
+    return;
+  }
+
+  String body = "{}";
+  const char* token = getSystemConfirmToken(endpoint);
+  if (token != nullptr) {
+    body = String("{\"confirm\":\"") + token + "\"}";
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(4000);
+  http.setTimeout(4000);
+  int httpCode = http.POST(body);
+  http.end();
+
+  if (labelControlStatus != nullptr) {
+    if (httpCode > 0 && httpCode < 400) {
+      if (strcmp(endpoint, "/shutdown") == 0) {
+        lv_label_set_text(labelControlStatus, "Shutdown requested");
+      } else if (strcmp(endpoint, "/restart") == 0) {
+        lv_label_set_text(labelControlStatus, "Restart requested");
+      } else if (strcmp(endpoint, "/lock") == 0) {
+        lv_label_set_text(labelControlStatus, "Lock requested");
+      } else if (strcmp(endpoint, "/sleep") == 0) {
+        lv_label_set_text(labelControlStatus, "Sleep requested");
+      } else if (strcmp(endpoint, "/logout") == 0) {
+        lv_label_set_text(labelControlStatus, "Logout requested");
+      } else if (strcmp(endpoint, "/switch_user") == 0) {
+        lv_label_set_text(labelControlStatus, "Switch user requested");
+      } else if (strcmp(endpoint, "/hibernate") == 0) {
+        lv_label_set_text(labelControlStatus, "Hibernate requested");
+      } else {
+        lv_label_set_text(labelControlStatus, "Command sent");
+      }
+    } else {
+      lv_label_set_text(labelControlStatus, "Command failed");
+    }
+  }
+}
+
+void onSystemControlClicked(lv_event_t* e) {
+  const char* endpoint = static_cast<const char*>(lv_event_get_user_data(e));
+  sendSystemCommand(endpoint);
 }
 
 // -------------------- LVGL Display + Touch --------------------
@@ -543,33 +614,91 @@ void createSystemPage() {
   lv_obj_set_pos(labelSystemApi, 8, 168);
 }
 
-void createGpuNetPage() {
-  lv_obj_set_style_pad_all(tabGpuNet, 8, LV_PART_MAIN);
-  createSectionTitle(tabGpuNet, "GPU + NETWORK", 0);
+void createControlPage() {
+  lv_obj_set_style_pad_all(tabControl, 8, LV_PART_MAIN);
+  createSectionTitle(tabControl, "SYSTEM CONTROL", 0);
 
-  labelGpuInfo = lv_label_create(tabGpuNet);
-  lv_label_set_text(labelGpuInfo, "GPU: unavailable");
-  lv_obj_set_style_text_color(labelGpuInfo, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelGpuInfo, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelGpuInfo, 8, 24);
+  labelControlHint = lv_label_create(tabControl);
+  lv_label_set_text(labelControlHint, "Use with care: these actions affect your PC");
+  lv_obj_set_style_text_color(labelControlHint, lv_color_hex(0x93A1B5), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelControlHint, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_set_pos(labelControlHint, 8, 18);
 
-  labelGpuVram = lv_label_create(tabGpuNet);
-  lv_label_set_text(labelGpuVram, "VRAM: 0/0 MB (0%)");
-  lv_obj_set_style_text_color(labelGpuVram, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelGpuVram, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelGpuVram, 8, 46);
+  labelControlStatus = lv_label_create(tabControl);
+  lv_label_set_text(labelControlStatus, "Ready");
+  lv_obj_set_style_text_color(labelControlStatus, lv_color_hex(0x62D394), LV_PART_MAIN);
+  lv_obj_set_style_text_font(labelControlStatus, &lv_font_montserrat_12, LV_PART_MAIN);
+  lv_obj_set_pos(labelControlStatus, 8, 32);
 
-  labelNetBytes = lv_label_create(tabGpuNet);
-  lv_label_set_text(labelNetBytes, "Bytes S/R: 0 / 0");
-  lv_obj_set_style_text_color(labelNetBytes, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelNetBytes, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelNetBytes, 8, 78);
+  const int startX = 8;
+  const int startY = 54;
+  const int buttonW = 94;
+  const int buttonH = 36;
+  const int gapX = 8;
+  const int gapY = 8;
 
-  labelNetPackets = lv_label_create(tabGpuNet);
-  lv_label_set_text(labelNetPackets, "Packets S/R: 0 / 0");
-  lv_obj_set_style_text_color(labelNetPackets, lv_color_hex(0xEEF3F9), LV_PART_MAIN);
-  lv_obj_set_style_text_font(labelNetPackets, &lv_font_montserrat_14, LV_PART_MAIN);
-  lv_obj_set_pos(labelNetPackets, 8, 100);
+  lv_obj_t* btnShutdown = lv_btn_create(tabControl);
+  lv_obj_set_size(btnShutdown, buttonW, buttonH);
+  lv_obj_set_pos(btnShutdown, startX, startY);
+  styleMediaButton(btnShutdown, lv_color_hex(0x7A1E1E));
+  lv_obj_add_event_cb(btnShutdown, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/shutdown");
+  lv_obj_t* lblShutdown = lv_label_create(btnShutdown);
+  lv_label_set_text(lblShutdown, "Shutdown");
+  lv_obj_center(lblShutdown);
+
+  lv_obj_t* btnRestart = lv_btn_create(tabControl);
+  lv_obj_set_size(btnRestart, buttonW, buttonH);
+  lv_obj_set_pos(btnRestart, startX + buttonW + gapX, startY);
+  styleMediaButton(btnRestart, lv_color_hex(0x8A4B1A));
+  lv_obj_add_event_cb(btnRestart, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/restart");
+  lv_obj_t* lblRestart = lv_label_create(btnRestart);
+  lv_label_set_text(lblRestart, "Restart");
+  lv_obj_center(lblRestart);
+
+  lv_obj_t* btnLock = lv_btn_create(tabControl);
+  lv_obj_set_size(btnLock, buttonW, buttonH);
+  lv_obj_set_pos(btnLock, startX + (buttonW + gapX) * 2, startY);
+  styleMediaButton(btnLock, lv_color_hex(0x1C4A7A));
+  lv_obj_add_event_cb(btnLock, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/lock");
+  lv_obj_t* lblLock = lv_label_create(btnLock);
+  lv_label_set_text(lblLock, "Lock");
+  lv_obj_center(lblLock);
+
+  lv_obj_t* btnSleep = lv_btn_create(tabControl);
+  lv_obj_set_size(btnSleep, buttonW, buttonH);
+  lv_obj_set_pos(btnSleep, startX, startY + buttonH + gapY);
+  styleMediaButton(btnSleep, lv_color_hex(0x3A365E));
+  lv_obj_add_event_cb(btnSleep, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/sleep");
+  lv_obj_t* lblSleep = lv_label_create(btnSleep);
+  lv_label_set_text(lblSleep, "Sleep");
+  lv_obj_center(lblSleep);
+
+  lv_obj_t* btnLogout = lv_btn_create(tabControl);
+  lv_obj_set_size(btnLogout, buttonW, buttonH);
+  lv_obj_set_pos(btnLogout, startX + buttonW + gapX, startY + buttonH + gapY);
+  styleMediaButton(btnLogout, lv_color_hex(0x5A3D1E));
+  lv_obj_add_event_cb(btnLogout, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/logout");
+  lv_obj_t* lblLogout = lv_label_create(btnLogout);
+  lv_label_set_text(lblLogout, "Logout");
+  lv_obj_center(lblLogout);
+
+  lv_obj_t* btnSwitch = lv_btn_create(tabControl);
+  lv_obj_set_size(btnSwitch, buttonW, buttonH);
+  lv_obj_set_pos(btnSwitch, startX + (buttonW + gapX) * 2, startY + buttonH + gapY);
+  styleMediaButton(btnSwitch, lv_color_hex(0x294765));
+  lv_obj_add_event_cb(btnSwitch, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/switch_user");
+  lv_obj_t* lblSwitch = lv_label_create(btnSwitch);
+  lv_label_set_text(lblSwitch, "Switch");
+  lv_obj_center(lblSwitch);
+
+  lv_obj_t* btnHibernate = lv_btn_create(tabControl);
+  lv_obj_set_size(btnHibernate, 196, buttonH);
+  lv_obj_set_pos(btnHibernate, startX + 52, startY + (buttonH + gapY) * 2);
+  styleMediaButton(btnHibernate, lv_color_hex(0x3F2B59));
+  lv_obj_add_event_cb(btnHibernate, onSystemControlClicked, LV_EVENT_CLICKED, (void*)"/hibernate");
+  lv_obj_t* lblHibernate = lv_label_create(btnHibernate);
+  lv_label_set_text(lblHibernate, "Hibernate");
+  lv_obj_center(lblHibernate);
 }
 
 void createMediaPage() {
@@ -708,21 +837,21 @@ void createUi() {
 
   tabDashboard = lv_tabview_add_tab(tabview, "Dash");
   tabSystem = lv_tabview_add_tab(tabview, "System");
-  tabGpuNet = lv_tabview_add_tab(tabview, "GPU/Net");
+  tabControl = lv_tabview_add_tab(tabview, "Control");
   tabMedia = lv_tabview_add_tab(tabview, "Media");
 
   lv_obj_set_style_bg_color(tabDashboard, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabDashboard, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabSystem, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabSystem, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_bg_color(tabGpuNet, lv_color_hex(0x000000), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(tabGpuNet, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(tabControl, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(tabControl, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_style_bg_color(tabMedia, lv_color_hex(0x000000), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(tabMedia, LV_OPA_COVER, LV_PART_MAIN);
 
   createDashboardPage();
   createSystemPage();
-  createGpuNetPage();
+  createControlPage();
   createMediaPage();
 
   labelHeaderTitle = lv_label_create(scr);
@@ -818,22 +947,6 @@ void refreshUiFromStats() {
 
   snprintf(line, sizeof(line), "API: %s | ts: %s", gStats.apiStatus, gStats.timestamp);
   lv_label_set_text(labelSystemApi, line);
-
-  if (gStats.gpuAvailable) {
-    snprintf(line, sizeof(line), "GPU: %.1f%% | %.1f C", gStats.gpuUsagePercent, gStats.gpuTempC);
-  } else {
-    snprintf(line, sizeof(line), "GPU: unavailable");
-  }
-  lv_label_set_text(labelGpuInfo, line);
-
-  snprintf(line, sizeof(line), "VRAM: %.1f/%.1f MB (%.1f%%)", gStats.gpuVramUsedMb, gStats.gpuVramTotalMb, gStats.gpuVramUsedPercent);
-  lv_label_set_text(labelGpuVram, line);
-
-  snprintf(line, sizeof(line), "Bytes S/R: %llu / %llu", (unsigned long long)gStats.bytesSent, (unsigned long long)gStats.bytesReceived);
-  lv_label_set_text(labelNetBytes, line);
-
-  snprintf(line, sizeof(line), "Packets S/R: %llu / %llu", (unsigned long long)gStats.packetsSent, (unsigned long long)gStats.packetsReceived);
-  lv_label_set_text(labelNetPackets, line);
 
   snprintf(line, sizeof(line), "State: %s", gStats.mediaPlaybackState);
   lv_label_set_text(labelMediaState, line);
