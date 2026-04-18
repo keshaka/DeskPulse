@@ -52,6 +52,14 @@ try:
 except ImportError:
     WINDOWS_MEDIA_API_AVAILABLE = False
 
+# Media control imports
+try:
+    import keyboard
+    KEYBOARD_CONTROL_AVAILABLE = True
+except ImportError:
+    KEYBOARD_CONTROL_AVAILABLE = False
+    logger.warning("keyboard library not available - media control disabled")
+
 
 # ==================== SYSTEM MONITORING FUNCTIONS ====================
 
@@ -492,6 +500,231 @@ def get_stats():
         return jsonify({
             "status": "error",
             "message": "Failed to collect system statistics"
+        }), 500
+
+
+# ==================== MEDIA CONTROL ENDPOINTS ====================
+
+def send_media_key(key_name):
+    """
+    Send a media control key using the keyboard library.
+    
+    Args:
+        key_name: Media key name (e.g., 'play_pause', 'next_track', 'prev_track', 'volume_up', 'volume_down')
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not KEYBOARD_CONTROL_AVAILABLE:
+        return False
+    
+    try:
+        # Map key names to keyboard module key codes
+        key_map = {
+            'play_pause': 'play/pause media',
+            'next_track': 'next track',
+            'prev_track': 'previous track',
+            'volume_up': 'volume up',
+            'volume_down': 'volume down'
+        }
+        
+        key = key_map.get(key_name)
+        if not key:
+            logger.warning(f"Unknown media key: {key_name}")
+            return False
+        
+        # Send the media key
+        keyboard.send(key)
+        logger.info(f"Media control command sent: {key_name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error sending media key {key_name}: {e}")
+        return False
+
+
+@app.route('/playpause', methods=['POST'])
+def playpause():
+    """
+    Toggle play/pause for currently active media player.
+    
+    Returns:
+        JSON: {
+            "status": "ok" | "error",
+            "action": "play/pause",
+            "message": str
+        }
+    """
+    try:
+        success = send_media_key('play_pause')
+        
+        if success:
+            return jsonify({
+                "status": "ok",
+                "action": "play/pause",
+                "message": "Play/pause command sent to active media player"
+            }), 200
+        else:
+            return jsonify({
+                "status": "error",
+                "action": "play/pause",
+                "message": "Media control unavailable"
+            }), 503
+            
+    except Exception as e:
+        logger.error(f"Error in playpause endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "play/pause",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/next', methods=['POST'])
+def next_track():
+    """
+    Skip to next track in currently active media player.
+    
+    Returns:
+        JSON: {
+            "status": "ok" | "error",
+            "action": "next",
+            "message": str
+        }
+    """
+    try:
+        success = send_media_key('next_track')
+        
+        if success:
+            return jsonify({
+                "status": "ok",
+                "action": "next",
+                "message": "Next track command sent"
+            }), 200
+        else:
+            return jsonify({
+                "status": "error",
+                "action": "next",
+                "message": "Media control unavailable"
+            }), 503
+            
+    except Exception as e:
+        logger.error(f"Error in next endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "next",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/previous', methods=['POST'])
+def previous_track():
+    """
+    Go to previous track in currently active media player.
+    
+    Returns:
+        JSON: {
+            "status": "ok" | "error",
+            "action": "previous",
+            "message": str
+        }
+    """
+    try:
+        success = send_media_key('prev_track')
+        
+        if success:
+            return jsonify({
+                "status": "ok",
+                "action": "previous",
+                "message": "Previous track command sent"
+            }), 200
+        else:
+            return jsonify({
+                "status": "error",
+                "action": "previous",
+                "message": "Media control unavailable"
+            }), 503
+            
+    except Exception as e:
+        logger.error(f"Error in previous endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "previous",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/volume_up', methods=['POST'])
+def volume_up():
+    """
+    Increase system volume.
+    
+    Returns:
+        JSON: {
+            "status": "ok" | "error",
+            "action": "volume_up",
+            "message": str
+        }
+    """
+    try:
+        success = send_media_key('volume_up')
+        
+        if success:
+            return jsonify({
+                "status": "ok",
+                "action": "volume_up",
+                "message": "Volume increased"
+            }), 200
+        else:
+            return jsonify({
+                "status": "error",
+                "action": "volume_up",
+                "message": "Media control unavailable"
+            }), 503
+            
+    except Exception as e:
+        logger.error(f"Error in volume_up endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "volume_up",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/volume_down', methods=['POST'])
+def volume_down():
+    """
+    Decrease system volume.
+    
+    Returns:
+        JSON: {
+            "status": "ok" | "error",
+            "action": "volume_down",
+            "message": str
+        }
+    """
+    try:
+        success = send_media_key('volume_down')
+        
+        if success:
+            return jsonify({
+                "status": "ok",
+                "action": "volume_down",
+                "message": "Volume decreased"
+            }), 200
+        else:
+            return jsonify({
+                "status": "error",
+                "action": "volume_down",
+                "message": "Media control unavailable"
+            }), 503
+            
+    except Exception as e:
+        logger.error(f"Error in volume_down endpoint: {e}")
+        return jsonify({
+            "status": "error",
+            "action": "volume_down",
+            "message": str(e)
         }), 500
 
 
