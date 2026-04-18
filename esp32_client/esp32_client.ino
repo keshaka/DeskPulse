@@ -23,6 +23,7 @@
 #include <ArduinoJson.h>
 #include <lvgl.h>
 #include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
 
 // -------------------- User Configuration --------------------
 const char* WIFI_SSID = "Sathuta HQ 2.4G";
@@ -43,6 +44,25 @@ static lv_disp_draw_buf_t draw_buf;
 static lv_color_t draw_buf_pixels[DRAW_BUF_PIXELS];
 static lv_disp_drv_t disp_drv;
 static lv_indev_drv_t indev_drv;
+
+// -------------------- Touch (XPT2046) --------------------
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+// Raw calibration ranges for CYD-like panels. Adjust if your panel differs.
+static const int TOUCH_MIN_X = 200;
+static const int TOUCH_MAX_X = 3700;
+static const int TOUCH_MIN_Y = 240;
+static const int TOUCH_MAX_Y = 3800;
+
+// Flip flags if touch appears mirrored on your hardware.
+static const bool TOUCH_FLIP_X = false;
+static const bool TOUCH_FLIP_Y = false;
+
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 
 // -------------------- Runtime State --------------------
 unsigned long lastPollMs = 0;
@@ -138,6 +158,12 @@ float clampFloat(float v, float lo, float hi) {
   return v;
 }
 
+int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
 void setSafeCopy(char* dst, size_t dstSize, const char* src, const char* fallback) {
   const char* finalSrc = src;
   if (finalSrc == nullptr || finalSrc[0] == '\0') {
@@ -162,14 +188,25 @@ void myDispFlush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p
 void myTouchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   (void)indev;
 
-  uint16_t x = 0;
-  uint16_t y = 0;
-  bool touched = tft.getTouch(&x, &y, 600);
+  if (touchscreen.tirqTouched() && touchscreen.touched()) {
+    TS_Point p = touchscreen.getPoint();
 
-  if (touched) {
+    int mappedX = map(p.x, TOUCH_MIN_X, TOUCH_MAX_X, 0, SCREEN_WIDTH - 1);
+    int mappedY = map(p.y, TOUCH_MIN_Y, TOUCH_MAX_Y, 0, SCREEN_HEIGHT - 1);
+
+    if (TOUCH_FLIP_X) {
+      mappedX = (SCREEN_WIDTH - 1) - mappedX;
+    }
+    if (TOUCH_FLIP_Y) {
+      mappedY = (SCREEN_HEIGHT - 1) - mappedY;
+    }
+
+    mappedX = clampInt(mappedX, 0, SCREEN_WIDTH - 1);
+    mappedY = clampInt(mappedY, 0, SCREEN_HEIGHT - 1);
+
     data->state = LV_INDEV_STATE_PR;
-    data->point.x = x;
-    data->point.y = y;
+    data->point.x = mappedX;
+    data->point.y = mappedY;
   } else {
     data->state = LV_INDEV_STATE_REL;
   }
@@ -181,6 +218,11 @@ void initLvglDisplay() {
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+
+  // Init XPT2046 touch controller on dedicated SPI pins.
+  SPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touchscreen.begin();
+  touchscreen.setRotation(1);
 
   lv_disp_draw_buf_init(&draw_buf, draw_buf_pixels, NULL, DRAW_BUF_PIXELS);
 
