@@ -44,11 +44,6 @@ try:
 except Exception as e:
     GPU_AVAILABLE = False
     logger.warning(f"NVIDIA GPU monitoring not available: {e}")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # ==================== SYSTEM MONITORING FUNCTIONS ====================
@@ -105,6 +100,43 @@ def get_disk_usage():
     }
 
 
+def get_cpu_temperature():
+    """
+    Get CPU temperature using WMI (Windows only).
+    
+    Returns:
+        dict: {
+            "celsius": float or None,
+            "fahrenheit": float or None,
+            "available": bool
+        }
+    """
+    temp_data = {
+        "celsius": None,
+        "fahrenheit": None,
+        "available": False
+    }
+    
+    if not WMI_AVAILABLE:
+        return temp_data
+    
+    try:
+        w = wmi.WMI(namespace="root\\cimv2")
+        temp_info = w.query("SELECT * FROM Win32_TemperatureProbe")
+        
+        if temp_info:
+            # Temperature is in tenths of Kelvin, convert to Celsius
+            kelvin_tenths = temp_info[0].CurrentReading
+            celsius = (kelvin_tenths / 10.0) - 273.15
+            temp_data["celsius"] = round(celsius, 1)
+            temp_data["fahrenheit"] = round((celsius * 9/5) + 32, 1)
+            temp_data["available"] = True
+    except Exception as e:
+        logger.debug(f"Error reading CPU temperature via WMI: {e}")
+    
+    return temp_data
+
+
 def get_network_usage():
     """
     Get network I/O statistics (upload/download speeds).
@@ -128,6 +160,139 @@ def get_network_usage():
     }
 
 
+def get_gpu_info():
+    """
+    Get GPU temperature and usage (NVIDIA GPUs only via pynvml).
+    
+    Returns:
+        dict: {
+            "temperature_celsius": float or None,
+            "temperature_fahrenheit": float or None,
+            "gpu_usage_percent": float or None,
+            "vram_used_mb": float or None,
+            "vram_total_mb": float or None,
+            "vram_used_percent": float or None,
+            "available": bool
+        }
+    """
+    gpu_data = {
+        "temperature_celsius": None,
+        "temperature_fahrenheit": None,
+        "gpu_usage_percent": None,
+        "vram_used_mb": None,
+        "vram_total_mb": None,
+        "vram_used_percent": None,
+        "available": False
+    }
+    
+    if not GPU_AVAILABLE:
+        return gpu_data
+    
+    try:
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count > 0:
+            # Get data from first GPU
+            device = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
+            # Get temperature
+            try:
+                temp_c = pynvml.nvmlDeviceGetTemperature(device, 0)
+                gpu_data["temperature_celsius"] = float(temp_c)
+                gpu_data["temperature_fahrenheit"] = round((temp_c * 9/5) + 32, 1)
+            except Exception:
+                pass
+            
+            # Get GPU utilization
+            try:
+                utilization = pynvml.nvmlDeviceGetUtilizationRates(device)
+                gpu_data["gpu_usage_percent"] = float(utilization.gpu)
+            except Exception:
+                pass
+            
+            # Get VRAM usage
+            try:
+                memory_info = pynvml.nvmlDeviceGetMemoryInfo(device)
+                gpu_data["vram_used_mb"] = round(memory_info.used / (1024**2), 2)
+                gpu_data["vram_total_mb"] = round(memory_info.total / (1024**2), 2)
+                gpu_data["vram_used_percent"] = round(
+                    (memory_info.used / memory_info.total) * 100, 1
+                )
+            except Exception:
+                pass
+            
+            gpu_data["available"] = True
+            
+    except Exception as e:
+        logger.debug(f"Error reading GPU info via pynvml: {e}")
+    
+    return gpu_data
+    """
+    Get GPU temperature and usage (NVIDIA GPUs only via pynvml).
+    
+    Returns:
+        dict: {
+            "temperature_celsius": float or None,
+            "temperature_fahrenheit": float or None,
+            "gpu_usage_percent": float or None,
+            "vram_used_mb": float or None,
+            "vram_total_mb": float or None,
+            "vram_used_percent": float or None,
+            "available": bool
+        }
+    """
+    gpu_data = {
+        "temperature_celsius": None,
+        "temperature_fahrenheit": None,
+        "gpu_usage_percent": None,
+        "vram_used_mb": None,
+        "vram_total_mb": None,
+        "vram_used_percent": None,
+        "available": False
+    }
+    
+    if not GPU_AVAILABLE:
+        return gpu_data
+    
+    try:
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count > 0:
+            # Get data from first GPU
+            device = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
+            # Get temperature
+            try:
+                temp_c = pynvml.nvmlDeviceGetTemperature(device, 0)
+                gpu_data["temperature_celsius"] = float(temp_c)
+                gpu_data["temperature_fahrenheit"] = round((temp_c * 9/5) + 32, 1)
+            except Exception:
+                pass
+            
+            # Get GPU utilization
+            try:
+                utilization = pynvml.nvmlDeviceGetUtilizationRates(device)
+                gpu_data["gpu_usage_percent"] = float(utilization.gpu)
+            except Exception:
+                pass
+            
+            # Get VRAM usage
+            try:
+                memory_info = pynvml.nvmlDeviceGetMemoryInfo(device)
+                gpu_data["vram_used_mb"] = round(memory_info.used / (1024**2), 2)
+                gpu_data["vram_total_mb"] = round(memory_info.total / (1024**2), 2)
+                gpu_data["vram_used_percent"] = round(
+                    (memory_info.used / memory_info.total) * 100, 1
+                )
+            except Exception:
+                pass
+            
+            gpu_data["available"] = True
+            
+    except Exception as e:
+        logger.debug(f"Error reading GPU info via pynvml: {e}")
+    
+    return gpu_data
+
+
 def get_system_stats():
     """
     Collect all system statistics in a lightweight format.
@@ -137,7 +302,9 @@ def get_system_stats():
     """
     return {
         "cpu_percent": round(get_cpu_usage(), 1),
+        "cpu_temp": get_cpu_temperature(),
         "ram": get_ram_usage(),
+        "gpu": get_gpu_info(),
         "disk": get_disk_usage(),
         "network": get_network_usage()
     }

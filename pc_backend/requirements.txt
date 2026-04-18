@@ -2,4 +2,6 @@ Flask==2.3.3
 Flask-CORS==4.0.0
 Werkzeug==2.3.7
 psutil==7.2.2
-pynvml==12.535.108
+pynvml==13.0.1
+WMI==1.5.1
+pywin32==311
